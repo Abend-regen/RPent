@@ -36,6 +36,18 @@ The policy retains observation history across calls and scripted actions.
 You have one attempt: do not reset the scene. Use the other available tools for
 recovery when needed. Episode end is not proof of task success."""
 
+AWOMO_POLICY = """Execute the configured policy using the environment's original
+task instruction. Read `view_env_state` first. Call `run_policy(max_steps)` to
+advance a bounded number of control steps. A budget return pauses execution;
+continue calling the same tool until `episode_ended` is true.
+Keep the task instruction unchanged. The policy owns its internal subtask
+reasoning. Do not rewrite goals, insert scripted recovery actions, or finish
+early because an object has been grasped. On cancellation or error, report the
+interruption without retrying uncertain policy state or resetting the episode.
+Read-only inspection does not advance the policy's observation history.
+The runner owns service startup and shutdown. Episode end is not proof of
+task success."""
+
 TOOL_ACCESS = """The planner supplies structured tools. Call them by the names
 shown in your tool list. The runner owns service startup and shutdown; do not
 manage environment or policy processes yourself.

@@ -102,6 +102,11 @@ class RoboDojoPolicyAdapter:
         if self._stateful:
             self._failed = True
 
+    @property
+    def last_action_info(self) -> dict[str, Any]:
+        """Metadata for the last inference, if the backend provides it."""
+        return getattr(self._client, "last_action_info", {})
+
     def end_episode(self) -> None:
         """Release stateful history ownership, retaining the underlying transport."""
         if not self._stateful or not self._active:

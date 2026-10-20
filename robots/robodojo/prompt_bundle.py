@@ -30,6 +30,12 @@ def system_prompt(
         return {
             "EXECUTION": "Replay the frozen plan using live RGB-D and robot proprioception. No language model participates."
         }
+    if (variables or {}).get("policy_backend") == "awomo05":
+        return {
+            "POLICY EXECUTION": system_parts.AWOMO_POLICY,
+            "REWARD AND SCORE": system_parts.REWARD,
+            "OUTPUT DISCIPLINE": system_parts.OUTPUT_DISCIPLINE,
+        }
     if (variables or {}).get("stateful_policy"):
         return {
             "ROLE AND RULES": system_parts.STATEFUL_POLICY,
@@ -58,6 +64,8 @@ def user_prompt(
     }
     if (variables or {}).get("mode") == "eval-fair":
         return {"TASK": "{{task}} / layout {{layout}}"}
+    if (variables or {}).get("policy_backend") == "awomo05":
+        return {"TASK": user_parts.TASK, "BEGIN": user_parts.POLICY_BEGIN}
     if (variables or {}).get("task") == "put_bottles_into_dustbin":
         sections["TASK CONTEXT"] = user_parts.PUT_BOTTLES_CONTEXT
     return sections

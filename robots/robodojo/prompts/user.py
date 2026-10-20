@@ -26,6 +26,9 @@ TASK = """- task:   {{task}}
 BEGIN = """Call `view_env_state` first to read the instruction and observe the
 scene, then localize targets and execute."""
 
+POLICY_BEGIN = """Read the original task instruction with `view_env_state`, then
+execute `run_policy` until the environment ends the episode or an error occurs."""
+
 PUT_BOTTLES_CONTEXT = """For put_bottles_into_dustbin:
 - Use `place_in_bin` to carry a held bottle to the bin mouth CENTER, descend
   below the rim, release, and retract. Releasing at mouth height can catch the rim.

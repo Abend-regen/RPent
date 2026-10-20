@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import argparse
 import signal
+import time
+from datetime import datetime
+from typing import Any
 
 from robots.robodojo.awomo05_contract import SESSION_METHODS, validate_model_meta
 from rpent.robots.components.xpolicylab_vla_server import (
@@ -46,6 +49,7 @@ class Awomo05Facade(XPolicyLabVLAFacade):
                 **validate_model_meta(meta),
                 "stateful": True,
                 "rpc_methods": list(SESSION_METHODS),
+                "action_info": True,
             }
         except BaseException:
             self.close()
@@ -58,6 +62,55 @@ class Awomo05Facade(XPolicyLabVLAFacade):
 
     def get_model_meta(self, *, session_id: str | None = None) -> dict:
         return dict(self._meta)
+
+    def _connect_policy(self, url: str, args: argparse.Namespace) -> Any:
+        # Inject an observer through the official synchronous client's supported
+        # client argument. Keep its encoding, request IDs, and state handling.
+        from client_server.ws.model_client import WsModelClient
+        from client_server.ws.protocol.client import (
+            PolicyEvalClient,
+            PolicyEvalClientConfig,
+        )
+
+        class ObservedClient(PolicyEvalClient):
+            async def call(self, *args, **kwargs):
+                response = await super().call(*args, **kwargs)
+                self.call_info = {
+                    k: v for k, v in response.payload.items() if k != "result"
+                }
+                return response
+
+        evaluation_id = args.evaluation_id or datetime.now().isoformat()
+        self._observed_client = ObservedClient(
+            PolicyEvalClientConfig(url=url, evaluation_id=evaluation_id)
+        )
+        return WsModelClient(
+            url=url,
+            evaluation_id=evaluation_id,
+            trial_id=f"{args.task}-vla",
+            action_case_id=f"{args.task}_case",
+            client=self._observed_client,
+        )
+
+    def _episode_call(self, **kwargs):
+        started = time.perf_counter()
+        result = super()._episode_call(**kwargs)
+        if kwargs["func_name"] != "get_action":
+            return result
+        # All metadata belongs to this inference, inside the episode lock. No
+        # second RPC or cached action copy is needed to retrieve it.
+        return {
+            "actions": result["actions"]
+            if isinstance(result, dict) and "actions" in result
+            else result,
+            "info": {
+                "upstream": self._observed_client.call_info,
+                "model": {k: v for k, v in result.items() if k != "actions"}
+                if isinstance(result, dict)
+                else {},
+                "bridge_rpc_s": time.perf_counter() - started,
+            },
+        }
 
 
 def main() -> None:

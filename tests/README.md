@@ -67,7 +67,7 @@ Run the complete suite with:
 pytest tests/unit_tests -v
 ```
 
-## RoboDojo Awomo05 bounded integration
+## RoboDojo Awomo05 integration
 
 `tests/e2e_tests/robodojo/test_awomo05.py` is opt-in through
 `RPENT_RUN_AWOMO05_INTEGRATION=1`. It requires exclusive real Awomo05 and
@@ -75,6 +75,15 @@ RoboDojo endpoints and verifies action-chunk continuation and episode reset.
 It is not part of `run_gpu_suite.sh` and does not measure official success rates.
 See the [RoboDojo guide](../docs/source-en/rst_source/simulators/robodojo.rst)
 for endpoint setup, environment variables and evidence output.
+
+`test_awomo05_complete.py` separately requires `RPENT_RUN_AWOMO05_COMPLETE=1`.
+It runs the actual API planner with a deterministic model, repeatedly calls
+`run_policy` on the original instruction until native episode end, then writes
+an audit and calls `finish`. `RPENT_POLICY_BUDGETS` selects control-step budgets
+(default `3,5,31`); layout and native step limit must match the endpoint and the
+chosen official reference. It validates complete execution and statistics,
+not autonomous strategy or aggregate benchmark success. Use fresh episodes
+and record simulator/model revisions for each comparison.
 
 ## RoboCasa environment smoke tests
 

@@ -355,6 +355,7 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
             "memory_dir": str(memory_dir),
             "mode": "eval-fair" if eval_fair else "dev",
             "stateful_policy": _uses_stateful_policy(args),
+            "policy_backend": args.policy_backend,
         },
         task_desc={
             "task": args.task,
@@ -587,6 +588,8 @@ def _init_runtime(
         else ("env", "sam3", "vla")
     )
     selected = set(starters) if components is None else set(components)
+    if components is None and args.policy_backend == "awomo05":
+        selected.discard("sam3")
     unknown = selected.difference(starters)
     if unknown:
         raise ValueError(f"unknown RoboDojo runtime components: {sorted(unknown)}")

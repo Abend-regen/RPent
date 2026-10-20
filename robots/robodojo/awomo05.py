@@ -47,6 +47,7 @@ class Awomo05Client(XPolicyLabVLAClient):
                 "Awomo05 endpoint must expose vla.get_model_meta; use the RoboDojo Awomo05 bridge"
             ) from exc
         self.model_meta = validate_model_meta(meta, bridge=True)
+        self.last_action_info: dict[str, Any] = {}
 
     def update_obs(self, obs: dict[str, Any], step: int) -> None:
         validate_native_state(obs.get("state", {}))
@@ -67,7 +68,23 @@ class Awomo05Client(XPolicyLabVLAClient):
         super().update_obs(obs, step)
 
     def get_action(self) -> list[dict[str, Any]]:
-        actions = super().get_action()
+        self.last_action_info = {}
+        if self.model_meta.get("action_info"):
+            result = self._client.call(
+                "vla.get_action",
+                kwargs={"include_info": True},
+                timeout_s=self._TIMEOUT_S["predict"],
+            )
+            if (
+                not isinstance(result, dict)
+                or "actions" not in result
+                or not isinstance(result.get("info"), dict)
+            ):
+                raise ValueError("Awomo05 returned an invalid action info envelope")
+            actions = result["actions"]
+            self.last_action_info = result["info"]
+        else:
+            actions = super().get_action()
         if (
             not isinstance(actions, (list, tuple))
             or not 1 <= len(actions) <= self.model_meta["replan_steps"]

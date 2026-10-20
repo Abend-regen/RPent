@@ -404,7 +404,8 @@ Then replace ``--policy-server-url``, ``--xpolicylab-root`` and
 exclusive. ``--policy-python`` aliases the existing ``--pi05-python`` option.
 Both modes validate model identity, native action layout, cameras, history,
 replanning and stateful capabilities before starting an episode. Configure
-SAM3 and the planner as described elsewhere on this page when using the CLI.
+the planner as described elsewhere on this page. Awomo runs do not start SAM3
+unless that component is explicitly requested.
 
 An independently managed model service is borrowed: RPent does not stop it.
 Give one active run exclusive access to both the environment and model service.
@@ -437,7 +438,8 @@ Run the offline regression tests without model weights:
 .. code-block:: bash
 
    pytest tests/unit_tests/robots/robodojo/test_awomo05_contracts.py \
-     tests/unit_tests/robots/robodojo/test_awomo05_loopback.py -v
+     tests/unit_tests/robots/robodojo/test_awomo05_loopback.py \
+     tests/unit_tests/robots/robodojo/test_awomo05_policy_tool.py -v
 
 For a bounded real-model check, prepare exclusive test endpoints and run:
 
@@ -460,16 +462,74 @@ and executes two more; it writes ``awomo05-result.json`` and closes the test
 environment. Early native success is a distinct outcome from passing this fixed
 cadence check. This test is opt-in and is not part of the GPU suite runner.
 
+Full-episode policy tool validation
+"""""""""""""""""""""""""""""""""""
+
+The Awomo toolkit exposes ``run_policy`` for robot actions, alongside
+``view_env_state`` and common audit/finish tools. It does not expose grasp,
+placement or scripted recovery tools. Its prompt keeps the original task
+instruction; RPent does not rewrite subtasks or stop when a grasp is detected.
+A budget return pauses execution while preserving valid pending actions.
+Continue until ``episode_ended`` or an execution error. A cancelled or failed
+call must not be retried automatically.
+
+For Awomo calls, ``log.result`` reports ``executed_steps``, ``observation_step``,
+``episode_ended``, ``pending_actions`` and ``stop_reason`` (``budget``,
+``episode_end``, ``cancelled`` or ``error``). Successful execution does not imply
+task success. Complete per-inference metadata is recorded in the action's
+``result.inferences`` in ``states.json``; the immediate tool response includes
+``inference_count`` instead of those details. Each inference is recorded only
+in the call that generated its chunk, even when later calls consume its tail.
+
+A bridge advertising ``action_info`` accepts ``include_info=True`` on
+``vla.get_action``. The default still returns actions, preserving existing
+clients. The Awomo client also continues to return an action list. Metadata
+contains the upstream response fields (including ``latency_ms`` when supplied),
+model result metadata and the measured ``bridge_rpc_s``. The execution report
+separately measures ``policy_rpc_s``, ``observation_rpc_s``, ``env_step_s`` and
+``elapsed_s`` in seconds. These nested wall-clock durations must not be added
+together as independent costs; ``elapsed_s`` excludes subsequent state capture
+and planner work. Setup/reset and the initial observation are outside the call.
+An older bridge without this capability remains usable and yields empty
+inference ``info``. Missing upstream timings are unavailable, not zero.
+
+To check complete task execution, use the same task, layout, checkpoint,
+configuration and native step limit as the official reference. Start exclusive
+endpoints, then run the fixed planner test:
+
+.. code-block:: bash
+
+   RPENT_RUN_AWOMO05_COMPLETE=1 \
+   RPENT_E2E_OUTPUT_DIR=/path/to/new-complete-evidence \
+   RPENT_ROBODOJO_TASK=stack_blocks_by_language \
+   RPENT_ROBODOJO_LAYOUT=13 RPENT_ROBODOJO_STEP_LIMIT=400 \
+   RPENT_POLICY_BUDGETS=3,5,31 \
+   RPENT_ROBODOJO_ENV_ENDPOINT=http://127.0.0.1:19106 \
+   RPENT_AWOMO05_POLICY_SERVER_URL=ws://127.0.0.1:19105 \
+   RPENT_XPOLICYLAB_ROOT="$XPL_ROOT" \
+     pytest tests/e2e_tests/robodojo/test_awomo05_complete.py -v -s
+
+The endpoint's layout and step limit must match these values. This opt-in test allows up to two hours. The test uses
+RPent's actual API planner and registered tools with a deterministic model;
+it retains the official instruction and permits ``finish`` only after native
+episode end. It exercises segmented continuation, checks every observation
+and inference step, writes an audit and ``complete-result.json``, and closes
+the test environment. No planner credentials or autonomous goal/recovery
+choices are involved. ``RPENT_POLICY_BUDGETS=400`` checks a single tool budget;
+``RPENT_AWOMO05_VLA_ENDPOINT`` selects a borrowed bridge as in the bounded test.
+Run each variant with a fresh episode. Compare the native termination, action
+sequence and success outcome with the official reference; a matching task name
+alone does not establish equivalent simulator semantics or model quality.
+
 Record the simulator/runtime and model source revisions separately. RPent's
 current RLinf runtime requires the packaged ``src.collect_client`` interface;
 an official source tree without that module cannot replace it using only
 ``--source-root``. Runtime integration results are not official baseline success
-rates. Full open-task evaluation and complete performance-statistics forwarding
-are outside this bounded integration check.
+rates. The bounded check alone does not establish full-episode passthrough.
 
 
-These tests require neither AWOmo weights nor Isaac Sim. They do not establish
-AWOmo inference quality, simulator camera cadence or benchmark success.
+The CPU regressions require neither Awomo weights nor Isaac Sim. They do not
+establish Awomo inference quality, simulator camera cadence or benchmark success.
 
 SAM3 Configuration
 ------------------

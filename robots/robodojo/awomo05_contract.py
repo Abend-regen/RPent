@@ -65,6 +65,8 @@ def validate_model_meta(meta: dict, *, bridge: bool = False) -> dict:
             "Awomo05 endpoint lacks reset/update_obs/get_action capabilities"
         )
     rpc_methods = meta.get("rpc_methods", [])
+    if bridge and "action_info" in meta and type(meta["action_info"]) is not bool:
+        raise ValueError("Awomo05 action_info capability must be a boolean")
     if bridge and (
         meta.get("stateful") is not True
         or not isinstance(rpc_methods, list)

@@ -96,6 +96,7 @@ def test_awomo_requires_exactly_one_endpoint_and_native_joint_robot():
         ("replan_steps", 17),
         ("replan_steps", True),
         ("action_layout", "qpos14"),
+        ("action_info", "true"),
     ],
 )
 def test_incompatible_endpoint_is_rejected_without_reset(key, value):
@@ -250,7 +251,7 @@ def test_bridge_checks_upstream_without_state_mutation_and_releases_transport(
         return metadata()
 
     model = SimpleNamespace(call=call, close=lambda: closed.append(True))
-    monkeypatch.setattr(shared, "_connect_policy", lambda *args: model)
+    monkeypatch.setattr(Awomo05Facade, "_connect_policy", lambda *args: model)
     parser = argparse.ArgumentParser()
     shared.add_backend_args(parser)
     facade = Awomo05Facade(
@@ -276,7 +277,7 @@ def test_rejected_upstream_closes_bridge_without_reset(monkeypatch):
         return {**metadata(), "policy_name": "Pi_05"}
 
     monkeypatch.setattr(
-        shared,
+        Awomo05Facade,
         "_connect_policy",
         lambda *args: SimpleNamespace(call=call, close=lambda: closed.append(True)),
     )

@@ -199,13 +199,16 @@ class XPolicyLabVLAFacade(BaseVLAFacade):
                 self._policy_daemon = _spawn_policy_server(args)
                 policy_url = f"ws://localhost:{args.policy_port}"
             logger.info("connecting to policy server: %s", policy_url)
-            self._model_client = _connect_policy(policy_url, args)
+            self._model_client = self._connect_policy(policy_url, args)
             self._ws_lock = threading.Lock()
             super().__init__(enable_sessions=self._stateful)
         except BaseException:
             self.close()
             raise
         logger.info("policy client connected")
+
+    def _connect_policy(self, url: str, args: argparse.Namespace) -> Any:
+        return _connect_policy(url, args)
 
     def _register_rpc(self) -> None:
         super()._register_rpc()
@@ -286,8 +289,10 @@ class XPolicyLabVLAFacade(BaseVLAFacade):
             self._next_step += 1
         return {"ok": True}
 
-    def get_action(self, *, session_id: str) -> Any:
-        """Infer from buffered observations without appending the latest frame again."""
+    def get_action(self, *, session_id: str, include_info: bool = False) -> Any:
+        """Infer once; optionally retain the upstream result envelope."""
+        if type(include_info) is not bool:
+            raise ValueError("include_info must be a boolean")
         with self._ws_lock:
             self._require_episode(session_id)
             current_step = self._next_step - 1
@@ -295,7 +300,7 @@ class XPolicyLabVLAFacade(BaseVLAFacade):
                 raise RuntimeError("A new observation is required before inference")
             result = self._episode_call(func_name="get_action")
             self._inferred_step = current_step
-        if isinstance(result, dict) and "actions" in result:
+        if not include_info and isinstance(result, dict) and "actions" in result:
             return result["actions"]
         return result
 

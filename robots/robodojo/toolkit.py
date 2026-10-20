@@ -31,10 +31,10 @@ if TYPE_CHECKING:
 class RoboDojoToolkit(Toolkit):
     """Toolkit for the RoboDojo (Isaac Sim) environment.
 
-    Every robot tool is registered for every task. ``eval_fair`` additionally
-    requires a mode-validated environment, removes file tools, and disables
-    development perception recording. Scoring and safety diagnostics are never
-    planner tools.
+    Awomo exposes policy execution and observation tools. Legacy backends retain
+    their manipulation tools. ``eval_fair`` additionally requires a
+    mode-validated environment, removes file tools, and disables development
+    perception recording. Scoring and safety diagnostics are never planner tools.
     """
 
     def __init__(
@@ -47,6 +47,7 @@ class RoboDojoToolkit(Toolkit):
     ) -> None:
         self.eval_fair = eval_fair
         self._stateful_policy = primitives_kwargs.get("stateful_policy", False)
+        self._policy_only = primitives_kwargs.get("policy_backend") == "awomo05"
         if self._stateful_policy and eval_fair:
             raise ValueError("Stateful policy execution is not supported in eval-fair")
         self._task_name = primitives_kwargs.get("task", "")
@@ -158,6 +159,12 @@ class RoboDojoToolkit(Toolkit):
         finally:
             self._primitives.env.close()
 
+    def cancel_active_and_wait(self) -> None:
+        """Drain tool calls before invalidating an interrupted Awomo episode."""
+        super().cancel_active_and_wait()
+        if self._policy_only:
+            self._primitives.env.interrupt()
+
     def solved(self) -> bool:
         """Read official success for the runner after planner execution."""
         if self.eval_fair:
@@ -168,6 +175,8 @@ class RoboDojoToolkit(Toolkit):
         from robots.robodojo import tools as robodojo_tools
 
         for definition in iter_tools(robodojo_tools):
+            if self._policy_only and definition.name != "view_env_state":
+                continue
             if self._stateful_policy and definition.name == "pi0_pick":
                 continue
             resources = {"state": self._state}
@@ -199,7 +208,17 @@ class RoboDojoToolkit(Toolkit):
             perception=self._pending_perception,
         )
         self._pending_perception = []
-        return robodojo_tools.view_env_state(record.step_idx, state=self._state)
+        observed = robodojo_tools.view_env_state(record.step_idx, state=self._state)
+        if self._policy_only and command.get("action") == "run_policy":
+            # Keep complete inference metadata in the existing StepRecord;
+            # the planner needs the execution outcome and a compact summary.
+            summary = {k: v for k, v in result.items() if k != "inferences"}
+            summary["inference_count"] = len(result.get("inferences", []))
+            observed.data["log"] = {
+                **observed.data["log"],
+                "result": summary,
+            }
+        return observed
 
 
 class RoboDojoPrimitives:
