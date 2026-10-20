@@ -12,9 +12,8 @@ uses Isaac Sim / IsaacLab with an ARX-X5 dual-arm platform.
    collision-free execution. Component and bounded execution checks do not
    establish a benchmark success rate.
 
-   ``pi0_pick``, ``stabilize``, and ``place_in_bin`` are not registered. Normal
-   startup loads Env and SAM3; no action-policy checkpoint is needed.
-   Flash replay remains unavailable.
+   ``pi0_pick``, ``stabilize``, and ``place_in_bin`` are not registered. Default
+   startup loads VPP2, not Pi0.5. Flash replay remains unavailable.
 
 Overview
 --------
@@ -24,7 +23,7 @@ Overview
 
    .. grid-item-card:: Action Models
 
-      Scripted pose and gripper primitives
+      Scripted primitives and VPP2
 
    .. grid-item-card:: Planners
 
@@ -83,7 +82,7 @@ Observation and Action
    * - Observation
      - Head and left/right wrist RGB-D images, camera calibration, and joint states, end-effector poses, and gripper states for both arms.
    * - Action
-     - ``move_to``, ``rotate_wrist``, ``set_gripper``, and ``release``. ``finish`` cannot override the native task verdict.
+     - ``move_to``, ``rotate_wrist``, ``set_gripper``, ``release``, and ``vpp2_act``. ``finish`` cannot override the native task verdict.
    * - Reward / success
      - RoboDojo's native environment determines task success, recorded in the ``success`` field of ``result.json``.
    * - Task prompt
@@ -179,6 +178,83 @@ Some NVIDIA resources referenced by the scene load online by default.
 For offline use or repeated resource-loading failures, see
 :ref:`robodojo-local-nvidia-assets` at the end of this page.
 
+VLA Configuration
+-----------------
+
+Normal CLI startup loads Env, SAM3 and VPP2. Prepare a VPP2 resource root
+before starting a task, or connect an existing service with
+``--vla-endpoint socket://host:port``. Missing resources are an error, not a
+fallback to Pi0.5 or analytic-only execution. Component-only developer runs
+may select Env without a model.
+
+The adapter targets the official
+`VPP2 RoboDojo implementation <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_.
+Keep its source checkout under ``policy/`` and the official downloaded weight
+layout under ``checkpoints/``. Symlinks to existing resources are supported:
+
+.. code-block:: text
+
+   /data/vpp2/
+   ├── policy/src/vpp2/policy.py
+   └── checkpoints/
+       ├── joint2b_s100000/
+       │   ├── action.pt
+       │   ├── video.pt
+       │   └── dataset_stats.json
+       └── Wan2.1-I2V-14B-480P/
+
+Download the complete paired 100k bundle, including support files, and shared
+encoders from `Haodong082399/VPP2 <https://huggingface.co/Haodong082399/VPP2>`_.
+Follow the pinned project's `inference environment instructions
+<https://github.com/roboterax/video-prediction-policy-2/blob/72c17acf022494ff63617be86079bb92e92f5bf8/docs/robodojo.md#policy-environment>`_.
+The simulator extra does not install VPP2's model dependencies. Do not overwrite
+the simulator's pinned Torch stack to match the policy environment; a separate
+model environment can install RPent's core package and serve VPP2:
+
+.. code-block:: bash
+
+   # In the prepared model environment, with RPent installed:
+   python -m robots.robodojo.vpp2_server --model-path /data/vpp2 \
+     --host 127.0.0.1 --port 9201
+
+   # In the RPent/simulator environment, add this to the task command:
+   # --vla-endpoint socket://127.0.0.1:9201
+
+If model dependencies are compatible with the current interpreter, set
+``VPP2_MODEL_PATH=/data/vpp2`` or ``--vla-model-path /data/vpp2`` for automatic
+local startup. Local VPP2 uses the current interpreter; ``--sim-python``
+selects only the simulator interpreter. Borrowed endpoints are not stopped
+by RPent.
+
+The agent supplies a required subtask through
+``vpp2_act(instruction, chunks=1)``; the environment's original instruction
+and success criterion remain unchanged. Each inference predicts 32 absolute
+dual-arm EE16 targets (xyz, wxyz and gripper per arm), executes the first 24
+through native EE control, then replans for another requested chunk.
+This does not call the analytic ``move_to`` planner for each target.
+
+The environment client retains an initial RGB anchor and at most 177 recent
+three-camera observations. Every executed native action updates the history,
+including analytic actions; image reads and ``render`` do not advance it.
+Requests contain the anchor plus eight samples ending at the current action,
+spaced by 25 actions; early missing times use the anchor. At 640×480 per camera,
+the raw uint8 cache is about 469 MiB per episode, not an unbounded video archive.
+Depth and full observations are not retained in this cache.
+
+The server uses official composition, history quantization and normalization.
+Inference seeds advance within an episode; switching subtasks does not reset
+them or the history. Actual reset clears both. Uncertain execution or missing
+action feedback invalidates policy history until reset; a read refresh cannot
+repair missing frames. Formal evaluation does not expose reset.
+
+The public checkpoint accepting a subtask string does not establish its
+subtask success rate. The default server loads the full model on one GPU;
+it does not distribute weights across multiple GPUs. A separate endpoint
+can serve a deployment with different memory requirements. No benchmark
+improvement is claimed. Legacy
+Pi0.5 diagnostics remain in source, but their flags do not select the default
+VLA or register old action tools.
+
 SAM3 Configuration
 ------------------
 
@@ -206,7 +282,8 @@ the terminal that will run the task:
 
    rpent-check-llm --planner codex --model <planner-model> --json
 
-Replace ``<planner-model>`` with the selected model. After configuring SAM3, run the bottle-disposal task. This command can move both arms:
+Replace ``<planner-model>`` with the selected model. After configuring VPP2
+and SAM3, run the bottle-disposal task. This command can move both arms:
 
 .. code-block:: bash
 
@@ -233,7 +310,7 @@ run, inspect these files in the directory selected by ``--output-dir``:
 - ``states.json``: commands, execution results and synchronized observation records.
 - Per-step RGB, metric depth, calibration and world-xyz artifacts for available cameras.
 - ``videos/``: head, left-wrist, and right-wrist camera videos.
-- ``robodojo_env_server.log`` and ``sam3_server.log``:
+- ``robodojo_env_server.log``, ``sam3_server.log`` and ``robodojo_vpp2_server.log``:
   locally owned service startup and error logs.
 - ``run.log`` and ``transcript_*.json``: main-process logs, planner conversations,
   and errors.
@@ -250,17 +327,17 @@ concurrent runs. For live monitoring, see :doc:`../guides/dashboard`.
 Common Options
 --------------
 
-RPent starts the simulator and SAM3 services in the current Python environment
+RPent starts the simulator, SAM3 and VPP2 services in the current Python environment
 by default. Specify ``--sim-python`` when the simulator uses a separate
-environment. Legacy Pi0.5 diagnostic helpers remain in source, but are not
-started by the CLI or exposed as planner tools.
+environment. ``--pi05-python`` does not select the VPP2 interpreter.
 
 - ``--task``, ``--seed`` (default 0) and ``--layout`` select a fixed scene.
   The seed selects the official layout group; layout selects an index within it. ``--random``
   ignores ``--layout`` and samples a new random scene on each reset.
 - ``--cuda-device`` selects the GPU for locally started services. If omitted,
   services inherit ``CUDA_VISIBLE_DEVICES``.
-- ``--env-endpoint`` and ``--sam3-endpoint`` connect to existing services.
+- ``--env-endpoint``, ``--sam3-endpoint`` and ``--vla-endpoint`` connect to
+  existing services. The VLA endpoint must serve this adapter's VPP2 protocol.
 - ``--source-root`` selects a local RoboDojo checkout instead of the packaged code.
 
 Child services inherit the current shell environment. The CLI does not load
