@@ -234,6 +234,70 @@ XPolicyLab 是另一套加载和运行 Pi0.5 的软件。使用前需单独克�
 ``--xpolicylab-root`` 指向单独克隆的 XPolicyLab 源码目录。如果 XPolicyLab 的 Pi0.5 推理所需\
 Python 包安装在另一个环境中，用 ``--pi05-python`` 指向该环境的 Python 解释器；否则省略此参数。
 
+有状态 XPolicyLab 策略
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+对于需要逐控制步历史观测的策略，先准备独立的 XPolicyLab WebSocket 服务，\
+实现 ``reset``、``update_obs`` 和 ``get_action``。历史缓存、预处理和动作块长度由模型适配器负责。
+请使用独立的服务和端口，避免与正在进行的评测共用。
+
+在已安装 RPent 和 XPolicyLab 客户端依赖的 Python 环境中，将 XPolicyLab 源码目录\
+加入 ``PYTHONPATH``，启动桥接：
+
+.. code-block:: bash
+
+   PYTHONPATH=/path/to/XPolicyLab python -m rpent.robots.components.xpolicylab_vla_server \
+     --task stack_blocks_by_language --stateful \
+     --policy-server-url ws://127.0.0.1:19105 \
+     --transport http --host 127.0.0.1 --port 19106
+
+按本页说明配置仿真、SAM3 和 planner 后，将 RPent 连接到桥接服务：
+
+.. code-block:: bash
+
+   rpent --robot robodojo --task stack_blocks_by_language --layout 0 \
+     --planner codex --model <planner-model> \
+     --policy-backend xpolicylab --stateful-policy \
+     --vla-endpoint http://127.0.0.1:19106 \
+     --output-dir /path/to/stateful-run
+
+此模式需显式启用，并提供外部桥接端点。默认 RLinf 和 XPolicyLab Pi0.5 启动路径保持原有行为。
+工具列表以 ``run_policy(max_steps)`` 替换 ``pi0_pick``，使用官方任务指令执行有限步数的动作块。
+每完成一个控制步，包括脚本动作，都会发送一次观测；读取场景或记录状态不会发送额外观测，\
+动作块边界也不会重复发送。工具包启动时重置一次模型；环境回合重置时同步清空模型历史，\
+同一回合内多次调用工具则保留历史。
+
+桥接复用 RPent RPC 会话机制，同一时刻只允许一个会话持有模型历史。\
+其他会话无法通过已占用的桥接重置模型或请求推理。持有者会话关闭或过期后释放占用；\
+工具包关闭时也会结束回合并释放占用，同时保留 VLA 连接供后续任务复用。新回合使用前必须重置。
+此机制无法隔离绕过桥接的客户端，因此上游模型服务也应专供该桥接使用。
+此模式暂不支持 Flash 回放。
+
+观测步号从零开始，必须连续。观测更新或推理失败后，该回合状态被标记为不可继续使用，\
+因为响应丢失前模型可能已经更新。环境动作结果不确定，或在已推理的动作块内取消执行时，\
+执行循环同样停止。不要自动重试这些调用，应开始新回合；planner 工具不提供回合重置操作。
+回合结束和动作执行完成均不能作为任务成功的证据。
+
+在 RoboDojo 内，``pi0_pick`` 和有状态执行循环统一使用 ``robots.robodojo.policy_adapter`` 中的 ``RoboDojoPolicyAdapter``。
+默认模式原样转发 ``predict(obs, options)``，回合与观测钩子不会额外调用后端。
+有状态模式通过 ``begin_episode(obs)`` 重置并记录第零步，随后调用 ``observe(obs, step=t)`` 和 ``predict(obs, step=t)``。若下一步观测尚未发送，\
+预测入口会先发送观测，因此两种调用顺序都只会记录一次该控制步。
+再次提交最新观测步号时不重复发送；旧步号或跳步会被拒绝。
+步号表示同一回合中的控制状态和指令，不根据图像内容判断是否重复。
+没有新观测时重复推理，仍会被有状态桥接拒绝。``end_episode()`` 释放占用，供后续任务使用。
+该适配器仅属于 RoboDojo，其他机器人和共享 VLA 接口保持现有契约。
+
+以下 CPU 测试使用假模型和假环境，覆盖桥接、两种 RPC 传输、工具执行、\
+会话占用、回合重置、取消和异常处理：
+
+.. code-block:: bash
+
+   pytest tests/unit_tests/robots/robodojo/test_policy_adapter_contracts.py \
+     tests/unit_tests/robots/robodojo/test_stateful_policy_loopback.py -v
+
+这些测试不需要 AWOmo 权重或 Isaac Sim，也不能证明 AWOmo 推理质量、\
+仿真相机刷新频率或基准任务成功率。
+
 SAM3 配置
 ---------
 

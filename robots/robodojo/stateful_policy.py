@@ -1,0 +1,172 @@
+# Copyright 2026 The RPent Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""RoboDojo control-step observation delivery for a stateful policy."""
+
+from __future__ import annotations
+
+from typing import Annotated, Any
+
+from pydantic import Field
+
+from robots.robodojo.policy_adapter import RoboDojoPolicyAdapter
+from robots.robodojo.tasks import validate_instruction
+from rpent.tools import ToolResult, tool
+from rpent.utils.logging import get_logger
+
+logger = get_logger("stateful_policy")
+
+
+@tool(readonly=False, exclude=("primitives", "state"))
+def run_policy(
+    primitives: Any,
+    state: Any,
+    max_steps: Annotated[int, Field(gt=0)] = 32,
+) -> ToolResult:
+    """Run the configured policy on the official task instruction for at most max_steps control steps.
+
+    Inspect the resulting images before continuing. Episode end does not itself
+    establish task success.
+    """
+    return ToolResult(data=primitives.env.run(max_steps))
+
+
+class StatefulPolicyEnv:
+    """Wrap one environment and one exclusive policy session.
+
+    All action tools use this boundary so scripted actions also advance model
+    history. Read-only environment calls pass through without recording frames.
+    """
+
+    def __init__(self, env, policy: RoboDojoPolicyAdapter, check_cancelled) -> None:
+        self._env = env
+        self._policy = policy
+        self._check_cancelled = check_cancelled
+        self._failed = True
+        self._closed = False
+        try:
+            self._start_episode()
+        except Exception:
+            try:
+                policy.end_episode()
+            except Exception:
+                logger.warning(
+                    "Failed to release policy after startup error", exc_info=True
+                )
+            raise
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._env, name)
+
+    def _start_episode(self) -> None:
+        self._failed = True
+        self._instruction = validate_instruction(self._env.get_task_language())
+        self._step = 0
+        self._done = False
+        self._obs = {
+            **self._env.get_obs(),
+            "instruction": self._instruction,
+        }
+        self._policy.begin_episode(self._obs)
+        self._failed = False
+
+    def _observe(self, obs: dict) -> None:
+        # Use the same task instruction for scripted and learned control.
+        self._obs = {**obs, "instruction": self._instruction}
+        self._policy.observe(self._obs, step=self._step)
+
+    def _invalidate_episode(self) -> None:
+        self._failed = True
+        self._policy.invalidate_episode()
+
+    def _require_ready(self) -> None:
+        if self._closed or self._failed:
+            raise RuntimeError("Policy episode is unavailable; start a new episode")
+
+    def reset(self) -> dict:
+        """Reset the environment and policy together for a new episode."""
+        if self._closed:
+            raise RuntimeError("Policy session is closed")
+        self._invalidate_episode()
+        obs = self._env.reset()
+        self._start_episode()
+        return obs
+
+    def step(self, action):
+        """Execute one native action and deliver its observation before returning."""
+        self._require_ready()
+        self._check_cancelled()
+        status = self._env.get_status()
+        if self._done or status["step"] >= status["step_limit"]:
+            raise RuntimeError("Episode has ended")
+        try:
+            # RoboDojo's native RPC returns four fields, unlike gym's five.
+            result = self._env.step(action)
+            obs, _reward, done, info = result
+            self._step += 1
+            self._observe(obs)
+            self._done = bool(done) or (
+                info["status"]["step"] >= info["status"]["step_limit"]
+            )
+            return result
+        except Exception:
+            # The action or observation may already have been applied.
+            self._invalidate_episode()
+            raise
+
+    def run(self, max_steps: int) -> dict[str, Any]:
+        """Execute policy chunks up to a control-step budget or episode end."""
+        if type(max_steps) is not int or max_steps <= 0:
+            raise ValueError("max_steps must be a positive integer")
+        self._require_ready()
+        executed = 0
+        while executed < max_steps and not self._done:
+            self._check_cancelled()
+            status = self._env.get_status()
+            if status["step"] >= status["step_limit"]:
+                self._done = True
+                break
+            try:
+                actions = self._policy.predict(self._obs, step=self._step)
+                if actions is None or len(actions) == 0:
+                    raise RuntimeError("Policy returned an empty action chunk")
+            except Exception:
+                self._invalidate_episode()
+                raise
+            for action in actions:
+                try:
+                    self.step(action)
+                except Exception:
+                    # Inference may itself advance model state. Discarding an
+                    # unexecuted chunk on cancellation requires a new episode.
+                    self._invalidate_episode()
+                    raise
+                executed += 1
+                if executed == max_steps or self._done:
+                    break
+        return {
+            "executed_steps": executed,
+            "episode_ended": self._done,
+            "observation_step": self._step,
+        }
+
+    def close(self) -> None:
+        """Release this episode and close its environment, retaining the VLA transport."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._policy.end_episode()
+        finally:
+            self._env.close()

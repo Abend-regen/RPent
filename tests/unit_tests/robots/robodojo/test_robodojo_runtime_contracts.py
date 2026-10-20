@@ -251,6 +251,52 @@ def test_runtime_connects_matching_policy_client(monkeypatch, tmp_path, backend)
         assert client._embodiment == "robodojo"
 
 
+def test_stateful_policy_requires_explicit_external_xpolicy_endpoint():
+    args = _args("--stateful-policy")
+    with pytest.raises(ValueError, match="requires"):
+        robot_spec._validate_args(args)
+    args.policy_backend = "xpolicylab"
+    with pytest.raises(ValueError, match="requires"):
+        robot_spec._validate_args(args)
+    args.vla_endpoint = "http://127.0.0.1:1234"
+    robot_spec._validate_args(args)
+    args.planner = "flash"
+    with pytest.raises(ValueError, match="Flash"):
+        robot_spec._validate_args(args)
+
+
+def test_stateful_endpoint_uses_framework_sessions(monkeypatch, tmp_path):
+    calls = []
+    rpc = object()
+
+    def connect(endpoint, **kwargs):
+        calls.append((endpoint, kwargs))
+        return rpc
+
+    monkeypatch.setattr(robot_spec, "make_rpc_client", connect)
+    args = _args(
+        "--stateful-policy",
+        "--policy-backend",
+        "xpolicylab",
+        "--vla-endpoint",
+        "http://policy:1234",
+    )
+    assert robot_spec._spawn_vla_server(args, tmp_path) == (None, rpc)
+    assert calls == [("http://policy:1234", {"enable_sessions": True})]
+
+
+def test_stateful_prompt_matches_available_tools():
+    bundle = robot_spec.get_robot_spec().prompts
+    prompt = bundle.render(
+        "system", variables={"stateful_policy": True, "output_dir": "/tmp/run"}
+    )
+    assert "run_policy" in prompt
+    assert "pi0_pick" not in prompt
+    default = bundle.render("system", variables={"output_dir": "/tmp/run"})
+    assert "pi0_pick" in default
+    assert "run_policy" not in default
+
+
 @pytest.mark.parametrize("lifting_arm", ["left", "right"])
 def test_pi0_pick_monitors_both_arms_and_preserves_policy_input(lifting_arm):
     def observation(z):
@@ -440,6 +486,7 @@ def test_toolkit_exposes_every_robot_tool(monkeypatch, tmp_path, task):
     # filters schemas by group or by task name.
     assert names & robot_names == robot_names
     assert "finish" in names
+    assert "run_policy" not in names
     for name in ("get_reward_details", "get_safety_status"):
         assert name not in names
         assert toolkit.execute_tool(name, {}).data == {"error": f"unknown tool: {name}"}

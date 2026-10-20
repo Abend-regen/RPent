@@ -30,6 +30,14 @@ def system_prompt(
         return {
             "EXECUTION": "Replay the frozen plan using live RGB-D and robot proprioception. No language model participates."
         }
+    if (variables or {}).get("stateful_policy"):
+        return {
+            "ROLE AND RULES": system_parts.STATEFUL_POLICY,
+            "TOOL ACCESS": system_parts.TOOL_ACCESS,
+            "SAFETY": system_parts.SAFETY,
+            "REWARD AND SCORE": system_parts.REWARD,
+            "OUTPUT DISCIPLINE": system_parts.OUTPUT_DISCIPLINE,
+        }
     return {
         "ROLE AND RULES": system_parts.ROLE_AND_RULES,
         "TOOL ACCESS": system_parts.TOOL_ACCESS,

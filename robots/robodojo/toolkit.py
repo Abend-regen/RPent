@@ -46,6 +46,9 @@ class RoboDojoToolkit(Toolkit):
         eval_fair: bool = False,
     ) -> None:
         self.eval_fair = eval_fair
+        self._stateful_policy = primitives_kwargs.get("stateful_policy", False)
+        if self._stateful_policy and eval_fair:
+            raise ValueError("Stateful policy execution is not supported in eval-fair")
         self._task_name = primitives_kwargs.get("task", "")
         if eval_fair and not getattr(primitives_kwargs.get("env"), "eval_fair", False):
             raise ValueError("eval-fair requires a mode-validated environment client")
@@ -110,24 +113,45 @@ class RoboDojoToolkit(Toolkit):
         does not re-reset here; this only establishes the initial state record.
         """
         from robots.robodojo import tools as robodojo_tools
+        from robots.robodojo.policy_adapter import RoboDojoPolicyAdapter
 
         self._pending_perception = []
         self._state.reset()
+        env = primitives_kwargs["env"]
+        client = primitives_kwargs.get("vla_client")
+        policy = (
+            RoboDojoPolicyAdapter(client, stateful=self._stateful_policy)
+            if client is not None
+            else None
+        )
+        if self._stateful_policy:
+            from robots.robodojo.stateful_policy import StatefulPolicyEnv
+
+            if policy is None:
+                raise ValueError("Stateful policy execution requires a VLA client")
+            env = StatefulPolicyEnv(env, policy, self.raise_if_cancelled)
         self._primitives = RoboDojoPrimitives(
-            env=primitives_kwargs["env"],
+            env=env,
             sam3_client=primitives_kwargs.get("sam3_client"),
-            vla_client=primitives_kwargs.get("vla_client"),
+            vla_client=policy,
             action_type=primitives_kwargs.get("action_type", "joint"),
             check_cancelled=self.raise_if_cancelled,
         )
-        self._publish_step(
-            robodojo_tools.dump_state(self._primitives, self._state, log=None)
-        )
+        try:
+            self._publish_step(
+                robodojo_tools.dump_state(self._primitives, self._state, log=None)
+            )
+        except Exception:
+            if self._stateful_policy:
+                env.close()
+            raise
 
     def close(self) -> None:
         """Flush the env server's episode videos before the daemon is stopped."""
-        super().close()
-        self._primitives.env.close()
+        try:
+            super().close()
+        finally:
+            self._primitives.env.close()
 
     def solved(self) -> bool:
         """Read official success for the runner after planner execution."""
@@ -139,10 +163,20 @@ class RoboDojoToolkit(Toolkit):
         from robots.robodojo import tools as robodojo_tools
 
         for definition in iter_tools(robodojo_tools):
+            if self._stateful_policy and definition.name == "pi0_pick":
+                continue
             resources = {"state": self._state}
             if definition.name != "view_env_state":
                 resources["primitives"] = self._primitives
             self.add_tool(definition.with_handler(partial(definition, **resources)))
+        if self._stateful_policy:
+            from robots.robodojo.stateful_policy import run_policy
+
+            self.add_tool(
+                run_policy.with_handler(
+                    partial(run_policy, primitives=self._primitives, state=self._state)
+                )
+            )
 
     def get_env_state(
         self,

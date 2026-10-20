@@ -28,6 +28,14 @@ Rules:
 - Both arms are available (`left` / `right`). The Pi_05 policy may choose
   either arm for a grasp; monitor both after `pi0_pick`."""
 
+STATEFUL_POLICY = """You control a RoboDojo episode through structured tools.
+Call `view_env_state` first to read the official instruction and inspect the scene.
+Use `run_policy(max_steps)` to execute the configured policy for a bounded number
+of control steps, then inspect the resulting images before continuing.
+The policy retains observation history across calls and scripted actions.
+You have one attempt: do not reset the scene. Use the other available tools for
+recovery when needed. Episode end is not proof of task success."""
+
 TOOL_ACCESS = """The planner supplies structured tools. Call them by the names
 shown in your tool list. The runner owns service startup and shutdown; do not
 manage environment or policy processes yourself.

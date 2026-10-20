@@ -91,6 +91,7 @@ ROBODOJO_DASHBOARD_SPEC: DashboardSpec = {
         "move_to",
         "set_gripper",
         "pi0_pick",
+        "run_policy",
         "stabilize",
         "place_in_bin",
     ),
@@ -144,6 +145,7 @@ def get_robot_spec() -> RobotSpec:
         dashboard=ROBODOJO_DASHBOARD_SPEC,
         run_flash=_run_flash,
         finalize_run=finalize_run,
+        validate_args=_validate_args,
     )
 
 
@@ -222,6 +224,11 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         help="Pi0.5 policy backend (default: rlinf)",
     )
     parser.add_argument(
+        "--stateful-policy",
+        action="store_true",
+        help="Use continuous observations with an external stateful XPolicyLab bridge",
+    )
+    parser.add_argument(
         "--pi05-python",
         default=sys.executable,
         help="Python executable with Pi_05 dependencies installed",
@@ -271,9 +278,21 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
     )
 
 
+def _validate_args(args: argparse.Namespace) -> None:
+    if not getattr(args, "stateful_policy", False):
+        return
+    if args.policy_backend != "xpolicylab" or not args.vla_endpoint:
+        raise ValueError(
+            "--stateful-policy requires --policy-backend xpolicylab and --vla-endpoint"
+        )
+    if getattr(args, "planner", None) == "flash":
+        raise ValueError("--stateful-policy is not supported with Flash replay")
+
+
 def _parse_config(args: argparse.Namespace) -> RunConfig:
     from robots.robodojo import tasks as robodojo_tasks
 
+    _validate_args(args)
     source_root = getattr(args, "source_root", None)
     err = robodojo_tasks.validate_task(args.task, source_root)
     if err:
@@ -307,6 +326,7 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
             "task_summary": summary,
             "memory_dir": str(memory_dir),
             "mode": "eval-fair" if eval_fair else "dev",
+            "stateful_policy": getattr(args, "stateful_policy", False),
         },
         task_desc={
             "task": args.task,
@@ -411,6 +431,8 @@ def _spawn_vla_server(
 ) -> tuple["ProcessDaemon | None", RpcClient]:
     """Spawn (or attach to) the RoboDojo Pi_05 VLA server."""
     if args.vla_endpoint is not None:
+        if getattr(args, "stateful_policy", False):
+            return None, make_rpc_client(args.vla_endpoint, enable_sessions=True)
         return None, make_rpc_client(args.vla_endpoint)
 
     pi05_python = str(Path(args.pi05_python).expanduser())
@@ -481,6 +503,7 @@ def _init_runtime(
     components: set[str] | None,
 ) -> tuple[list[ProcessDaemon], dict[str, Any]]:
     """Initialize every RoboDojo component, or only ``components`` when given."""
+    _validate_args(args)
     from robots.robodojo.env_client import RoboDojoEnvClient
     from rpent.robots.components.pi05_vla_client import Pi05VLAClient
     from rpent.robots.components.sam3_client import Sam3Client
@@ -556,4 +579,5 @@ def _init_runtime(
 
     primitives_kwargs["action_type"] = args.action_type
     primitives_kwargs["task"] = args.task
+    primitives_kwargs["stateful_policy"] = getattr(args, "stateful_policy", False)
     return list(owned_daemons.values()), primitives_kwargs

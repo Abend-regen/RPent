@@ -268,6 +268,86 @@ If the Python packages needed for XPolicyLab's Pi0.5 inference are installed in
 a separate environment, point ``--pi05-python`` to that environment's Python
 interpreter; otherwise omit the option.
 
+Stateful XPolicyLab Policies
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For a policy that needs control-step history, prepare a dedicated XPolicyLab
+WebSocket server implementing ``reset``, ``update_obs`` and ``get_action``.
+The model owns its history buffer, preprocessing and action-chunk length.
+Use a separate server and port from any ongoing evaluation.
+
+In a Python environment containing RPent and XPolicyLab's client dependencies,
+start the bridge with the XPolicyLab checkout on ``PYTHONPATH``:
+
+.. code-block:: bash
+
+   PYTHONPATH=/path/to/XPolicyLab python -m rpent.robots.components.xpolicylab_vla_server \
+     --task stack_blocks_by_language --stateful \
+     --policy-server-url ws://127.0.0.1:19105 \
+     --transport http --host 127.0.0.1 --port 19106
+
+With the simulator, SAM3 and planner configured as described on this page,
+connect RPent to that bridge:
+
+.. code-block:: bash
+
+   rpent --robot robodojo --task stack_blocks_by_language --layout 0 \
+     --planner codex --model <planner-model> \
+     --policy-backend xpolicylab --stateful-policy \
+     --vla-endpoint http://127.0.0.1:19106 \
+     --output-dir /path/to/stateful-run
+
+This opt-in path requires an external bridge endpoint. The default RLinf and
+XPolicyLab Pi0.5 launch paths retain their existing behavior.
+``run_policy(max_steps)`` replaces ``pi0_pick`` in the tool list. It executes
+bounded action chunks using the official task instruction. Each completed
+control step, including scripted motions, sends one observation; reading or
+recording the scene sends none. Chunk boundaries do not duplicate observations.
+The model is reset once when the toolkit starts, and environment resets also
+reset model history. Repeated tool calls in an episode preserve that history.
+
+The bridge uses RPent RPC sessions and allows one history owner at a time.
+Another session cannot reset or infer through the occupied bridge. Closing or
+expiring the owner session releases ownership; toolkit close also releases the
+episode while retaining the VLA connection for later tasks. A new episode must
+reset before use. This does not isolate clients that bypass the bridge: dedicate the
+upstream model server to this bridge. Flash replay is not supported in this
+mode.
+
+Observation steps start at zero and must be contiguous. Observation or inference
+failures invalidate the episode because a lost response may follow a successful
+model mutation. The execution loop also stops after an uncertain environment
+action or cancellation within an inferred chunk. Do not automatically retry
+these calls; start a new episode. Planner tools do not expose an episode reset.
+Episode end and action execution are not task-success evidence.
+
+Within RoboDojo, both ``pi0_pick`` and the stateful execution loop use
+``RoboDojoPolicyAdapter`` from ``robots.robodojo.policy_adapter``. Legacy
+``predict(obs, options)`` calls pass through unchanged; episode and observation
+hooks make no backend calls in legacy mode. Stateful callers use
+``begin_episode(obs)`` to reset and record step zero, then
+``observe(obs, step=t)`` and ``predict(obs, step=t)``. Prediction also records
+the next observation if it has not yet been delivered, so either call order
+sends each control step once. Repeating the latest observation step is a no-op;
+older or skipped steps are rejected. Step identity refers to the same control
+state and instruction within one episode, not equality of image contents.
+Repeated inference without a new observation remains disallowed by the
+stateful bridge. ``end_episode()`` releases ownership for the next task.
+The adapter is local to RoboDojo; other robots and the shared VLA interfaces
+keep their existing contracts.
+
+CPU-only tests exercise the bridge, both RPC transports, toolkit execution,
+ownership, reset, cancellation and failure handling with a fake model and
+environment:
+
+.. code-block:: bash
+
+   pytest tests/unit_tests/robots/robodojo/test_policy_adapter_contracts.py \
+     tests/unit_tests/robots/robodojo/test_stateful_policy_loopback.py -v
+
+These tests require neither AWOmo weights nor Isaac Sim. They do not establish
+AWOmo inference quality, simulator camera cadence or benchmark success.
+
 SAM3 Configuration
 ------------------
 
