@@ -219,9 +219,9 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
     )
     parser.add_argument(
         "--policy-backend",
-        choices=["rlinf", "xpolicylab"],
+        choices=["rlinf", "xpolicylab", "awomo05"],
         default="rlinf",
-        help="Pi0.5 policy backend (default: rlinf)",
+        help="Policy backend (default: rlinf Pi0.5)",
     )
     parser.add_argument(
         "--stateful-policy",
@@ -230,8 +230,9 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
     )
     parser.add_argument(
         "--pi05-python",
+        "--policy-python",
         default=sys.executable,
-        help="Python executable with Pi_05 dependencies installed",
+        help="Policy/bridge Python executable (--pi05-python is retained)",
     )
     parser.add_argument(
         "--task",
@@ -266,10 +267,15 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         default=None,
         help="[protocol://]host:port of an existing env_server",
     )
-    parser.add_argument(
+    policy_endpoint = parser.add_mutually_exclusive_group()
+    policy_endpoint.add_argument(
         "--vla-endpoint",
         default=None,
-        help="[protocol://]host:port of an existing Pi_05 policy server",
+        help="[protocol://]host:port of an existing RPent VLA RPC server",
+    )
+    policy_endpoint.add_argument(
+        "--policy-server-url",
+        help="ws[s]://host:port of an existing Awomo05 policy server",
     )
     parser.add_argument(
         "--sam3-endpoint",
@@ -278,14 +284,36 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
     )
 
 
+def _uses_stateful_policy(args: argparse.Namespace) -> bool:
+    return args.policy_backend == "awomo05" or getattr(args, "stateful_policy", False)
+
+
 def _validate_args(args: argparse.Namespace) -> None:
-    if not getattr(args, "stateful_policy", False):
-        return
-    if args.policy_backend != "xpolicylab" or not args.vla_endpoint:
+    from urllib.parse import urlsplit
+
+    upstream = getattr(args, "policy_server_url", None)
+    if upstream and args.vla_endpoint:
         raise ValueError(
-            "--stateful-policy requires --policy-backend xpolicylab and --vla-endpoint"
+            "--vla-endpoint and --policy-server-url are mutually exclusive"
         )
-    if getattr(args, "planner", None) == "flash":
+    if upstream and args.policy_backend != "awomo05":
+        raise ValueError("--policy-server-url requires --policy-backend awomo05")
+    if args.policy_backend == "awomo05":
+        if not (upstream or args.vla_endpoint):
+            raise ValueError("awomo05 requires --vla-endpoint or --policy-server-url")
+        if args.env_cfg_type != "arx_x5" or args.action_type != "joint":
+            raise ValueError("awomo05 requires arx_x5 with absolute joint actions")
+        if upstream and (
+            urlsplit(upstream).scheme not in {"ws", "wss"}
+            or not urlsplit(upstream).hostname
+        ):
+            raise ValueError("--policy-server-url must be a ws:// or wss:// URL")
+    elif _uses_stateful_policy(args):
+        if args.policy_backend != "xpolicylab" or not args.vla_endpoint:
+            raise ValueError(
+                "--stateful-policy requires --policy-backend xpolicylab and --vla-endpoint"
+            )
+    if _uses_stateful_policy(args) and getattr(args, "planner", None) == "flash":
         raise ValueError("--stateful-policy is not supported with Flash replay")
 
 
@@ -326,7 +354,7 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
             "task_summary": summary,
             "memory_dir": str(memory_dir),
             "mode": "eval-fair" if eval_fair else "dev",
-            "stateful_policy": getattr(args, "stateful_policy", False),
+            "stateful_policy": _uses_stateful_policy(args),
         },
         task_desc={
             "task": args.task,
@@ -431,9 +459,14 @@ def _spawn_vla_server(
 ) -> tuple["ProcessDaemon | None", RpcClient]:
     """Spawn (or attach to) the RoboDojo Pi_05 VLA server."""
     if args.vla_endpoint is not None:
-        if getattr(args, "stateful_policy", False):
+        if _uses_stateful_policy(args):
             return None, make_rpc_client(args.vla_endpoint, enable_sessions=True)
         return None, make_rpc_client(args.vla_endpoint)
+
+    if args.policy_backend == "awomo05":
+        from robots.robodojo.awomo05 import spawn_bridge
+
+        return spawn_bridge(args, output_dir)
 
     pi05_python = str(Path(args.pi05_python).expanduser())
     if not Path(pi05_python).exists():
@@ -540,13 +573,19 @@ def _init_runtime(
             "vla_client": (
                 Pi05VLAClient(rpc, embodiment="robodojo")
                 if args.policy_backend == "rlinf"
+                else _connect_awomo(rpc)
+                if args.policy_backend == "awomo05"
                 else XPolicyLabVLAClient(rpc)
             )
         },
         "sam3": lambda rpc: {"sam3_client": Sam3Client(rpc)},
     }
     timeouts = {"env": 900.0, "sam3": 300.0, "vla": 1800.0}
-    wait_order = ("env", "sam3", "vla")
+    wait_order = (
+        ("vla", "env", "sam3")
+        if args.policy_backend == "awomo05"
+        else ("env", "sam3", "vla")
+    )
     selected = set(starters) if components is None else set(components)
     unknown = selected.difference(starters)
     if unknown:
@@ -579,5 +618,12 @@ def _init_runtime(
 
     primitives_kwargs["action_type"] = args.action_type
     primitives_kwargs["task"] = args.task
-    primitives_kwargs["stateful_policy"] = getattr(args, "stateful_policy", False)
+    primitives_kwargs["stateful_policy"] = _uses_stateful_policy(args)
+    primitives_kwargs["policy_backend"] = args.policy_backend
     return list(owned_daemons.values()), primitives_kwargs
+
+
+def _connect_awomo(rpc: RpcClient):
+    from robots.robodojo.awomo05 import Awomo05Client
+
+    return Awomo05Client(rpc)

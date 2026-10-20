@@ -345,6 +345,129 @@ environment:
    pytest tests/unit_tests/robots/robodojo/test_policy_adapter_contracts.py \
      tests/unit_tests/robots/robodojo/test_stateful_policy_loopback.py -v
 
+Awomo-0.5 backend
+^^^^^^^^^^^^^^^^^
+
+``--policy-backend awomo05`` uses the official XPolicyLab ``Awomo05`` model
+through the stateful RoboDojo adapter. It requires ``arx_x5`` and absolute
+``joint`` actions, and automatically enables ``run_policy``. Flash replay is
+not supported. The default RLinf/Pi0.5 path is unchanged.
+
+Prepare the official model environment, checkpoint and matching statistics
+using XPolicyLab's Awomo05 installation instructions. Keep model and simulator
+interpreters separate. In the model environment, start this thin launcher from
+the RPent checkout; it uses the official model and adds read-only metadata:
+
+.. code-block:: bash
+
+   export XPL_ROOT=/path/to/RoboDojo/XPolicyLab
+   export PYTHONPATH="$(dirname "$XPL_ROOT"):$XPL_ROOT:${PYTHONPATH:-}"
+   CUDA_VISIBLE_DEVICES=<free-model-gpu> /path/to/awomo/python \
+     robots/robodojo/awomo05_policy_server.py \
+     --config_path "$XPL_ROOT/policy/Awomo05/deploy.yml" \
+     --host 127.0.0.1 --port 19105 \
+     --overrides policy_name=Awomo05 bench_name=RoboDojo \
+     task_name=stack_blocks_by_language env_cfg_type=arx_x5 action_type=joint \
+     seed=0 ckpt=model.pt input_color_order=bgr replan_steps=8
+
+Use the official weight-path environment variables and model configuration.
+The launcher does not copy model code or alter inference, normalization,
+history sampling or AR state. An unmodified older service without
+``get_model_meta`` is rejected before reset; launch a dedicated compatible
+service rather than probing it with state-changing calls.
+
+Choose exactly one connection mode. For an existing official WebSocket service,
+RPent starts only a lightweight bridge. The bridge interpreter needs RPent and
+XPolicyLab's client dependencies (including WebSockets, msgpack and
+msgpack-numpy); it does not load model weights:
+
+.. code-block:: bash
+
+   rpent --robot robodojo --task stack_blocks_by_language --layout 0 \
+     --planner codex --model <planner-model> --policy-backend awomo05 \
+     --policy-server-url ws://127.0.0.1:19105 \
+     --xpolicylab-root "$XPL_ROOT" --policy-python /path/to/bridge/python \
+     --env-endpoint http://127.0.0.1:19106 --output-dir /path/to/awomo-run
+
+Alternatively, start a reusable RPent Awomo bridge with the XPolicyLab checkout
+and its parent on ``PYTHONPATH``:
+
+.. code-block:: bash
+
+   /path/to/bridge/python -m robots.robodojo.awomo05_bridge \
+     --task stack_blocks_by_language --policy-server-url ws://127.0.0.1:19105 \
+     --host 127.0.0.1 --port 19107
+
+Then replace ``--policy-server-url``, ``--xpolicylab-root`` and
+``--policy-python`` in the RPent command with
+``--vla-endpoint http://127.0.0.1:19107``. The two endpoint options are mutually
+exclusive. ``--policy-python`` aliases the existing ``--pi05-python`` option.
+Both modes validate model identity, native action layout, cameras, history,
+replanning and stateful capabilities before starting an episode. Configure
+SAM3 and the planner as described elsewhere on this page when using the CLI.
+
+An independently managed model service is borrowed: RPent does not stop it.
+Give one active run exclusive access to both the environment and model service.
+The bridge's session ownership cannot prevent another official client or a
+second bridge from resetting the same upstream model.
+
+The wire observation keeps RGB ``uint8`` HWC images in the order ``cam_head``,
+``cam_left_wrist``, ``cam_right_wrist``. The released checkpoint's BGR conversion
+occurs once inside the official adapter. State packing there is left arm (6),
+left gripper (1), right arm (6), right gripper (1). Returned actions retain those
+four named fields; they never pass through Pi0.5's different flattened layout.
+Joint targets are absolute radians, with normalized gripper opening (0 closed,
+1 open) mapped by the native environment. Each control target represents 0.04 s
+of simulated time, not a wall-clock delay imposed by network inference.
+
+For Awomo, the local execution loop is the sole owner of unexecuted returned
+actions. Calls such as ``run_policy(3)`` followed by ``run_policy(5)`` consume one
+8-action chunk when the episode, instruction and environment step remain
+consistent. A scripted action drops the remainder and sends its new observation
+without resetting model history. Cancellation, errors, instruction changes or
+unobserved environment advancement discard the remainder and block further
+execution until an explicit episode reset. Episode end drops remaining actions
+and does not send a terminal observation, matching the official deploy loop.
+Cache invalidation itself never invokes model reset. Same-step out-of-band
+resets cannot be detected from the current environment API; use exclusive
+endpoints and perform resets through the execution boundary.
+
+Run the offline regression tests without model weights:
+
+.. code-block:: bash
+
+   pytest tests/unit_tests/robots/robodojo/test_awomo05_contracts.py \
+     tests/unit_tests/robots/robodojo/test_awomo05_loopback.py -v
+
+For a bounded real-model check, prepare exclusive test endpoints and run:
+
+.. code-block:: bash
+
+   RPENT_RUN_AWOMO05_INTEGRATION=1 \
+   RPENT_E2E_OUTPUT_DIR=/path/to/new-evidence \
+   RPENT_ROBODOJO_ENV_ENDPOINT=http://127.0.0.1:19106 \
+   RPENT_ROBODOJO_STEP_LIMIT=40 \
+   RPENT_AWOMO05_POLICY_SERVER_URL=ws://127.0.0.1:19105 \
+   RPENT_XPOLICYLAB_ROOT="$XPL_ROOT" \
+     pytest tests/e2e_tests/robodojo/test_awomo05.py -v -s
+
+The environment must be configured for the selected task, layout 0 and the
+specified step limit. ``RPENT_ROBODOJO_TASK`` defaults to
+``stack_blocks_by_language``, an official open task. To test a borrowed bridge,
+set ``RPENT_AWOMO05_VLA_ENDPOINT`` instead of
+``RPENT_AWOMO05_POLICY_SERVER_URL``. The test executes 3+5+2 control steps, resets
+and executes two more; it writes ``awomo05-result.json`` and closes the test
+environment. Early native success is a distinct outcome from passing this fixed
+cadence check. This test is opt-in and is not part of the GPU suite runner.
+
+Record the simulator/runtime and model source revisions separately. RPent's
+current RLinf runtime requires the packaged ``src.collect_client`` interface;
+an official source tree without that module cannot replace it using only
+``--source-root``. Runtime integration results are not official baseline success
+rates. Full open-task evaluation and complete performance-statistics forwarding
+are outside this bounded integration check.
+
+
 These tests require neither AWOmo weights nor Isaac Sim. They do not establish
 AWOmo inference quality, simulator camera cadence or benchmark success.
 

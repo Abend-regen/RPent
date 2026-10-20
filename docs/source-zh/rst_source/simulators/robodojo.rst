@@ -295,6 +295,77 @@ Python 包安装在另一个环境中，用 ``--pi05-python`` 指向该环境的
    pytest tests/unit_tests/robots/robodojo/test_policy_adapter_contracts.py \
      tests/unit_tests/robots/robodojo/test_stateful_policy_loopback.py -v
 
+Awomo-0.5 后端
+^^^^^^^^^^^^^^^^
+
+``--policy-backend awomo05`` 通过 Robodojo 有状态适配层调用 XPolicyLab 官方 ``Awomo05`` 模型，要求使用 ``arx_x5`` 和绝对 ``joint`` 动作，并自动启用 ``run_policy``。该路径不支持 Flash replay；默认 RLinf/Pi0.5 路径保持原有行为。
+
+先按 XPolicyLab 的 Awomo05 安装说明准备独立模型环境、权重及匹配的统计量，模型与仿真使用不同解释器。在 RPent 仓库根目录，用模型环境启动薄包装服务：
+
+.. code-block:: bash
+
+   export XPL_ROOT=/path/to/RoboDojo/XPolicyLab
+   export PYTHONPATH="$(dirname "$XPL_ROOT"):$XPL_ROOT:${PYTHONPATH:-}"
+   CUDA_VISIBLE_DEVICES=<free-model-gpu> /path/to/awomo/python \
+     robots/robodojo/awomo05_policy_server.py \
+     --config_path "$XPL_ROOT/policy/Awomo05/deploy.yml" \
+     --host 127.0.0.1 --port 19105 \
+     --overrides policy_name=Awomo05 bench_name=RoboDojo \
+     task_name=stack_blocks_by_language env_cfg_type=arx_x5 action_type=joint \
+     seed=0 ckpt=model.pt input_color_order=bgr replan_steps=8
+
+沿用官方权重路径环境变量和模型配置。该启动器复用官方模型，仅增加只读元信息，不复制模型代码，也不改变推理、归一化、历史采样或 AR 状态。缺少 ``get_model_meta`` 的旧服务会在 reset 前被拒绝；应启动独立的兼容服务，不使用改变状态的调用探测能力。
+
+连接模式二选一。连接已有官方 WebSocket 服务时，RPent 只启动轻量桥接；桥接解释器需要安装 RPent 和 XPolicyLab 客户端依赖，包括 WebSockets、msgpack 和 msgpack-numpy，无需加载模型权重：
+
+.. code-block:: bash
+
+   rpent --robot robodojo --task stack_blocks_by_language --layout 0 \
+     --planner codex --model <planner-model> --policy-backend awomo05 \
+     --policy-server-url ws://127.0.0.1:19105 \
+     --xpolicylab-root "$XPL_ROOT" --policy-python /path/to/bridge/python \
+     --env-endpoint http://127.0.0.1:19106 --output-dir /path/to/awomo-run
+
+也可预先启动可复用的 RPent Awomo 桥接；将 XPolicyLab 目录及其父目录加入 ``PYTHONPATH``：
+
+.. code-block:: bash
+
+   /path/to/bridge/python -m robots.robodojo.awomo05_bridge \
+     --task stack_blocks_by_language --policy-server-url ws://127.0.0.1:19105 \
+     --host 127.0.0.1 --port 19107
+
+随后将 RPent 命令中的 ``--policy-server-url``、``--xpolicylab-root`` 和 ``--policy-python`` 替换为 ``--vla-endpoint http://127.0.0.1:19107``。两类端点参数互斥。``--policy-python`` 是现有 ``--pi05-python`` 的别名。两种模式都会在回合开始前检查模型身份、原生动作布局、相机、历史、重规划和有状态能力。使用 CLI 时，仍需按本页其他章节配置 SAM3 和 planner。
+
+独立模型服务属于借用资源，RPent 退出时不会停止它。一个运行任务应独占环境和模型服务；桥接的会话锁无法阻止另一官方客户端或另一桥接重置同一个上游模型。
+
+观测在线路上传输为 RGB、``uint8``、HWC 图像，顺序为 ``cam_head``、``cam_left_wrist``、``cam_right_wrist``。发布权重所需的 BGR 换序仅在官方 adapter 内发生一次。官方状态打包顺序为左臂 6 维、左夹爪 1 维、右臂 6 维、右夹爪 1 维；返回动作保留这四个具名字段，不经过 Pi0.5 的不同扁平向量布局。关节目标为绝对弧度值，夹爪开度为 0 关闭、1 张开，由原生环境映射为实际关节量。每个控制目标对应 0.04 秒仿真时间，不以网络推理耗时决定控制频率。
+
+Awomo 路径中，本地执行层是已返回、尚未执行动作的唯一缓存持有者。在回合、指令和环境步数保持一致时，先 ``run_policy(3)`` 再 ``run_policy(5)`` 会执行同一组 8 步动作。脚本动作清空剩余动作并补送新观测，保留模型历史。取消、异常、换指令或检测到环境绕过执行层推进时，清空剩余动作并阻止继续执行，直到显式重置回合。回合结束时清空动作且不再发送终止观测，与官方部署循环一致。清空缓存本身不会调用模型 reset。现有环境接口无法识别步数未变的外部 reset，因此必须使用独占端点并通过执行层重置。
+
+无需模型权重即可运行离线回归：
+
+.. code-block:: bash
+
+   pytest tests/unit_tests/robots/robodojo/test_awomo05_contracts.py \
+     tests/unit_tests/robots/robodojo/test_awomo05_loopback.py -v
+
+准备独占的测试端点后，运行真实模型的有界验证：
+
+.. code-block:: bash
+
+   RPENT_RUN_AWOMO05_INTEGRATION=1 \
+   RPENT_E2E_OUTPUT_DIR=/path/to/new-evidence \
+   RPENT_ROBODOJO_ENV_ENDPOINT=http://127.0.0.1:19106 \
+   RPENT_ROBODOJO_STEP_LIMIT=40 \
+   RPENT_AWOMO05_POLICY_SERVER_URL=ws://127.0.0.1:19105 \
+   RPENT_XPOLICYLAB_ROOT="$XPL_ROOT" \
+     pytest tests/e2e_tests/robodojo/test_awomo05.py -v -s
+
+环境需使用所选任务、layout 0 和指定步数上限。``RPENT_ROBODOJO_TASK`` 默认为官方 open 任务 ``stack_blocks_by_language``。验证已有桥接时，用 ``RPENT_AWOMO05_VLA_ENDPOINT`` 替代 ``RPENT_AWOMO05_POLICY_SERVER_URL``。测试执行 3+5+2 步、重置后再执行 2 步，写出 ``awomo05-result.json`` 并关闭测试环境。任务提前成功与通过该固定节奏检查是不同结果。此测试需显式启用，未接入通用 GPU 套件运行器。
+
+分别记录仿真运行时和模型源码版本。RPent 当前 RLinf 运行时要求打包源码中的 ``src.collect_client`` 接口；缺少该模块的官方源码不能仅通过 ``--source-root`` 替换。运行时接入结果不等于官方基线成功率。有界验证不覆盖完整 open 任务评测或完整性能统计透传。
+
+
 这些测试不需要 AWOmo 权重或 Isaac Sim，也不能证明 AWOmo 推理质量、\
 仿真相机刷新频率或基准任务成功率。
 

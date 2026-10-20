@@ -129,7 +129,12 @@ class RoboDojoToolkit(Toolkit):
 
             if policy is None:
                 raise ValueError("Stateful policy execution requires a VLA client")
-            env = StatefulPolicyEnv(env, policy, self.raise_if_cancelled)
+            env = StatefulPolicyEnv(
+                env,
+                policy,
+                self.raise_if_cancelled,
+                resume_chunks=primitives_kwargs.get("policy_backend") == "awomo05",
+            )
         self._primitives = RoboDojoPrimitives(
             env=env,
             sam3_client=primitives_kwargs.get("sam3_client"),

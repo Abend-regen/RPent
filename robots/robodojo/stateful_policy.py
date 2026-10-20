@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from typing import Annotated, Any
 
 from pydantic import Field
@@ -49,7 +50,16 @@ class StatefulPolicyEnv:
     history. Read-only environment calls pass through without recording frames.
     """
 
-    def __init__(self, env, policy: RoboDojoPolicyAdapter, check_cancelled) -> None:
+    def __init__(
+        self,
+        env,
+        policy: RoboDojoPolicyAdapter,
+        check_cancelled,
+        *,
+        resume_chunks: bool = False,
+    ) -> None:
+        self._resume_chunks = resume_chunks
+        self._pending = deque()
         self._env = env
         self._policy = policy
         self._check_cancelled = check_cancelled
@@ -70,7 +80,9 @@ class StatefulPolicyEnv:
         return getattr(self._env, name)
 
     def _start_episode(self) -> None:
+        self._discard_actions()
         self._failed = True
+        self._native_step = self._env.get_status()["step"]
         self._instruction = validate_instruction(self._env.get_task_language())
         self._step = 0
         self._done = False
@@ -86,7 +98,22 @@ class StatefulPolicyEnv:
         self._obs = {**obs, "instruction": self._instruction}
         self._policy.observe(self._obs, step=self._step)
 
+    def _discard_actions(self) -> None:
+        # This is the sole cache of returned actions. It never resets the model.
+        self._pending.clear()
+
+    def _check_context(self) -> None:
+        if not self._resume_chunks:
+            return
+        if self._env.get_status()["step"] != self._native_step:
+            raise RuntimeError(
+                "Environment advanced outside the policy boundary; start a new episode"
+            )
+        if validate_instruction(self._env.get_task_language()) != self._instruction:
+            raise RuntimeError("Task instruction changed; start a new episode")
+
     def _invalidate_episode(self) -> None:
+        self._discard_actions()
         self._failed = True
         self._policy.invalidate_episode()
 
@@ -104,24 +131,40 @@ class StatefulPolicyEnv:
         return obs
 
     def step(self, action):
-        """Execute one native action and deliver its observation before returning."""
+        """Apply an external tool action, invalidating any cached policy remainder."""
+        self._discard_actions()
+        return self._step_action(action)
+
+    def _step_action(self, action):
         self._require_ready()
-        self._check_cancelled()
-        status = self._env.get_status()
-        if self._done or status["step"] >= status["step_limit"]:
-            raise RuntimeError("Episode has ended")
         try:
-            # RoboDojo's native RPC returns four fields, unlike gym's five.
+            self._check_cancelled()
+            self._check_context()
+            status = self._env.get_status()
+            if self._done or status["step"] >= status["step_limit"]:
+                self._done = True
+                self._discard_actions()
+                raise RuntimeError("Episode has ended")
             result = self._env.step(action)
             obs, _reward, done, info = result
+            if self._resume_chunks and info["status"]["step"] != self._native_step + 1:
+                raise RuntimeError(
+                    "Environment did not execute exactly one control step"
+                )
             self._step += 1
-            self._observe(obs)
+            self._native_step = info["status"]["step"]
             self._done = bool(done) or (
-                info["status"]["step"] >= info["status"]["step_limit"]
+                self._native_step >= info["status"]["step_limit"]
             )
+            # Official Awomo deploy.py does not record a terminal observation.
+            if not (self._resume_chunks and self._done):
+                self._check_context()
+                self._observe(obs)
+            if self._done:
+                self._discard_actions()
             return result
         except Exception:
-            # The action or observation may already have been applied.
+            # Applied actions / lost observations can leave history uncertain.
             self._invalidate_episode()
             raise
 
@@ -130,6 +173,8 @@ class StatefulPolicyEnv:
         if type(max_steps) is not int or max_steps <= 0:
             raise ValueError("max_steps must be a positive integer")
         self._require_ready()
+        if self._resume_chunks:
+            return self._run_continuous(max_steps)
         executed = 0
         while executed < max_steps and not self._done:
             self._check_cancelled()
@@ -161,11 +206,41 @@ class StatefulPolicyEnv:
             "observation_step": self._step,
         }
 
+    def _run_continuous(self, max_steps: int) -> dict[str, Any]:
+        executed = 0
+        try:
+            self._check_cancelled()
+            self._check_context()
+            while executed < max_steps and not self._done:
+                self._check_cancelled()
+                self._check_context()
+                status = self._env.get_status()
+                if status["step"] >= status["step_limit"]:
+                    self._done = True
+                    self._discard_actions()
+                    break
+                if not self._pending:
+                    actions = self._policy.predict(self._obs, step=self._step)
+                    if actions is None or len(actions) == 0:
+                        raise RuntimeError("Policy returned an empty action chunk")
+                    self._pending.extend(actions)
+                self._step_action(self._pending.popleft())
+                executed += 1
+        except Exception:
+            self._invalidate_episode()
+            raise
+        return {
+            "executed_steps": executed,
+            "episode_ended": self._done,
+            "observation_step": self._step,
+        }
+
     def close(self) -> None:
         """Release this episode and close its environment, retaining the VLA transport."""
         if self._closed:
             return
         self._closed = True
+        self._discard_actions()
         try:
             self._policy.end_episode()
         finally:
