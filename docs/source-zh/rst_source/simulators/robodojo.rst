@@ -7,7 +7,7 @@ RoboDojo
 
    解析式工具调用原生 cuRobo 位姿规划，并执行关节目标。规划器默认障碍物模型只有简化桌面，未包含全部物体或另一只机械臂。路径规划及抽样不能保证执行时无碰撞。组件检查和有界动作执行检查不能说明基准任务成功率。
 
-   ``pi0_pick``、``stabilize`` 和 ``place_in_bin`` 不注册。常规启动仅加载 Env 和 SAM3，不需要动作策略权重；Flash 重放仍不可用。
+   ``pi0_pick``、``stabilize`` 和 ``place_in_bin`` 不注册。默认加载 VPP2，不加载 Pi0.5；Flash 重放仍不可用。
 
 概览
 ----
@@ -17,7 +17,7 @@ RoboDojo
 
    .. grid-item-card:: 动作模型
 
-      解析式位姿和夹爪 Primitive
+      解析式 Primitive 和 VPP2
 
    .. grid-item-card:: 规划器
 
@@ -73,7 +73,7 @@ RoboDojo
    * - 观测
      - 头部和左右腕部相机的 RGB-D 图像、相机标定，以及双臂关节状态、末端执行器位姿和夹爪开合状态。
    * - 动作
-     - ``move_to``、``rotate_wrist``、``set_gripper`` 和 ``release``。``finish`` 不能覆盖原生任务判定。
+     - ``move_to``、``rotate_wrist``、``set_gripper``、``release`` 和 ``vpp2_act``。``finish`` 不能覆盖原生任务判定。
    * - 奖励与成功判定
      - 任务是否成功由 RoboDojo 原生环境判定，结果记录在 ``result.json`` 的 ``success`` 字段中。
    * - 任务指令
@@ -156,6 +156,50 @@ NVIDIA 驱动版本建议参考 `Isaac Sim 5.1 官方系统要求 <https://docs.
 
 场景引用的部分 NVIDIA 素材默认在线加载。离线运行或相关资源持续加载失败时，参见文末的 :ref:`robodojo-local-nvidia-assets`。
 
+VLA 配置
+--------
+
+常规 CLI 默认启动 Env、SAM3 和 VPP2。运行任务前准备 VPP2 资源目录，或通过
+``--vla-endpoint socket://host:port`` 连接已有服务。资源缺失时明确报错，不回退到 Pi0.5 或纯解析式执行。开发者仅检查环境时，可单独选择 Env 组件。
+
+接入针对官方
+`VPP2 RoboDojo 实现 <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_。
+源码放在 ``policy/``，权重保留官方 ``checkpoints/`` 布局；已有资源可通过软链接复用：
+
+.. code-block:: text
+
+   /data/vpp2/
+   ├── policy/src/vpp2/policy.py
+   └── checkpoints/
+       ├── joint2b_s100000/
+       │   ├── action.pt
+       │   ├── video.pt
+       │   └── dataset_stats.json
+       └── Wan2.1-I2V-14B-480P/
+
+从 `Haodong082399/VPP2 <https://huggingface.co/Haodong082399/VPP2>`_ 下载完整的配对 100k 权重包（含配套文件）和共享编码器。按固定版本的
+`推理环境说明 <https://github.com/roboterax/video-prediction-policy-2/blob/72c17acf022494ff63617be86079bb92e92f5bf8/docs/robodojo.md#policy-environment>`_ 准备模型依赖。
+仿真 extra 不包含 VPP2 模型依赖。不要为模型覆盖仿真环境固定的 Torch 栈；可在独立模型环境中安装 RPent 核心包并启动服务：
+
+.. code-block:: bash
+
+   # 在已准备模型依赖、安装 RPent 的环境中：
+   python -m robots.robodojo.vpp2_server --model-path /data/vpp2 \
+     --host 127.0.0.1 --port 9201
+
+   # 在 RPent／仿真环境的任务命令后添加：
+   # --vla-endpoint socket://127.0.0.1:9201
+
+若模型依赖与当前解释器兼容，设置 ``VPP2_MODEL_PATH=/data/vpp2`` 或 ``--vla-model-path /data/vpp2`` 即可自动启动本地服务。本地 VPP2 使用当前解释器；``--sim-python`` 只选择仿真解释器。连接已有服务时，RPent 不负责关闭该服务。
+
+Agent 通过 ``vpp2_act(instruction, chunks=1)`` 明确传入当前子任务；环境原始任务指令和成功判定不变。每次推理预测 32 个双臂 EE16 绝对目标（每臂 xyz、wxyz 和夹爪），通过原生 EE 控制执行前 24 步；请求更多 chunk 时重新观测、重新预测。这里不会为每个目标调用解析式 ``move_to`` 规划器。
+
+环境客户端保存初始 RGB 锚点和最近最多 177 个时刻的三路 RGB。每次真实原生动作都会更新历史，包括解析式动作；看图和 ``render`` 不增加动作时刻。每次请求发送锚点及截至当前的 8 个采样时刻，相邻间隔 25 个动作；早期不足的时刻使用锚点。若每路均为 640×480，uint8 缓存每回合约 469 MiB，不会随运行时长无限增长；缓存不保留深度或完整观测。
+
+模型服务使用官方图像拼接、历史量化和归一化。推理随机种子按回合内序号递增，切换子任务不清空历史或重置序号，真实 reset 才清空。动作执行不确定或反馈缺失后，策略历史失效，直到 reset；看图刷新不能补齐丢失帧。正式评测不开放 reset。
+
+公开权重能够接收子任务字符串，不代表已验证其子任务成功率。默认服务在单张 GPU 上加载完整模型，不会跨卡分配权重；其他部署方式可通过独立服务端点接入。不宣称基准成绩提升。旧 Pi0.5 诊断代码保留，但其参数不选择默认 VLA，也不注册旧动作工具。
+
 SAM3 配置
 ---------
 
@@ -180,7 +224,7 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 
    rpent-check-llm --planner codex --model <planner-model> --json
 
-将 ``<planner-model>`` 替换为所选模型名，配置好 SAM3 后运行瓶子入桶任务。此命令会让 Agent 控制双臂动作：
+将 ``<planner-model>`` 替换为所选模型名，配置好 VPP2 和 SAM3 后运行瓶子入桶任务。此命令会让 Agent 控制双臂动作：
 
 .. code-block:: bash
 
@@ -206,7 +250,7 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 - ``states.json``：工具命令、执行结果及同帧观测记录。
 - 各相机逐步保存的 RGB、米制深度、标定和世界坐标三维图。
 - ``videos/``：头部、左腕和右腕相机的视频。
-- ``robodojo_env_server.log`` 和 ``sam3_server.log``：\
+- ``robodojo_env_server.log``、``sam3_server.log``、``robodojo_vpp2_server.log``：\
   本地启动服务的日志和报错信息。
 - ``run.log`` 和 ``transcript_*.json``：主进程日志、planner 对话和错误。
 
@@ -220,12 +264,14 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 常用参数
 --------
 
-默认由 RPent 在当前 Python 环境中启动仿真和 SAM3 服务。仿真器安装在独立环境时，指定 ``--sim-python``。旧 Pi0.5 诊断辅助代码保留在源码中，但 CLI 不启动该服务，也不向规划器开放其工具。
+默认由 RPent 在当前 Python 环境中启动仿真、SAM3 和 VPP2 服务。仿真器安装在独立环境时，指定 ``--sim-python``。\
+``--pi05-python`` 不选择 VPP2 的解释器。
 
 - ``--task``、``--seed``（默认 0）和 ``--layout``：选择任务、官方布局组和组内布局编号；传入 ``--random`` 时忽略 ``--layout``，\
   每次重置重新采样随机场景。
 - ``--cuda-device``：为本地启动的服务选择 GPU；省略时沿用 ``CUDA_VISIBLE_DEVICES``。
-- ``--env-endpoint`` 和 ``--sam3-endpoint``：连接已有服务。
+- ``--env-endpoint``、``--sam3-endpoint``、``--vla-endpoint``：连接已有服务。\
+  VLA 服务必须实现本适配器的 VPP2 协议。
 - ``--source-root``：使用本地 RoboDojo 源码替代包内源码。
 
 子服务继承当前终端的环境变量；CLI 不会自动读取 ``config/runtime.env``。\
