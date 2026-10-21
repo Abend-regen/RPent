@@ -341,7 +341,7 @@ progress; it never retries an action. ``simulation_time_s`` in
 Stateful adapter cooperation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The default Env + SAM3 toolchain needs no VLA. A future adapter can register one
+The default Env + SAM3 toolchain needs no VLA. An adapter can register one
 synchronous callback with ``env.register_execution_observer(callback)`` or pass
 ``execution_observer`` in toolkit runtime kwargs. Registration emits ``attached``
 with the current observation and status; it does not reset the environment or
@@ -386,8 +386,271 @@ resume it explicitly. Eval-fair services forbid reset, so recovery requires a ne
 episode/service. Closing a toolkit ends its cooperation boundary; a subsequent
 session must create a new client/adapter. No action is retried after a missing
 reply. Offline fake-adapter checks and simulator primitive checks validate this
-public contract, not compatibility with real Awomo or VPP2 models. Real model
-integration and complete-episode comparisons are separate acceptance work.
+public contract, not compatibility with every VLA. The Awomo integration below
+consumes this contract; complete-episode evidence remains a separate check.
+
+Stateful XPolicyLab Policies
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For a policy that needs control-step history, prepare a dedicated XPolicyLab
+WebSocket server implementing ``reset``, ``update_obs`` and ``get_action``.
+The model owns its history buffer, preprocessing and action-chunk length.
+Use a separate server and port from any ongoing evaluation.
+
+In a Python environment containing RPent and XPolicyLab's client dependencies,
+start the bridge with the XPolicyLab checkout on ``PYTHONPATH``:
+
+.. code-block:: bash
+
+   PYTHONPATH=/path/to/XPolicyLab python -m rpent.robots.components.xpolicylab_vla_server \
+     --task stack_blocks_by_language --stateful \
+     --policy-server-url ws://127.0.0.1:19105 \
+     --transport http --host 127.0.0.1 --port 19106
+
+With the simulator, SAM3 and planner configured as described on this page,
+connect RPent to that bridge:
+
+.. code-block:: bash
+
+   rpent --robot robodojo --task stack_blocks_by_language --layout 0 \
+     --planner codex --model <planner-model> \
+     --policy-backend xpolicylab --stateful-policy \
+     --vla-endpoint http://127.0.0.1:19106 \
+     --output-dir /path/to/stateful-run
+
+This opt-in path requires an external bridge endpoint. Default startup remains
+Env + SAM3 without a policy service. ``run_policy(max_steps)`` is added alongside
+the native primitives. It executes
+bounded action chunks using the official task instruction. Each completed
+control step, including scripted motions, sends one observation; reading or
+recording the scene sends none. Chunk boundaries do not duplicate observations.
+The model is reset once when the toolkit starts, and environment resets also
+reset model history. Repeated tool calls in an episode preserve that history.
+
+The bridge uses RPent RPC sessions and allows one history owner at a time.
+Another session cannot reset or infer through the occupied bridge. Closing or
+expiring the owner session releases ownership; toolkit close also releases the
+episode while retaining the VLA connection for later tasks. A new episode must
+reset before use. This does not isolate clients that bypass the bridge: dedicate the
+upstream model server to this bridge. Flash replay is not supported in this
+mode.
+
+Observation steps start at zero and must be contiguous. Observation or inference
+failures invalidate the episode because a lost response may follow a successful
+model mutation. The execution loop also stops after an uncertain environment
+action. Cancellation instead clears pending actions and pauses admission without
+resetting model history. Do not automatically retry uncertain calls; explicitly
+reset before using an untrusted episode. Planner tools do not expose an episode reset.
+Episode end and action execution are not task-success evidence.
+
+The stateful execution loop uses ``RoboDojoPolicyAdapter`` from ``robots.robodojo.policy_adapter``. Legacy
+``predict(obs, options)`` calls pass through unchanged; episode and observation
+hooks make no backend calls in legacy mode. Stateful callers use
+``begin_episode(obs)`` to reset and record step zero, then
+``observe(obs, step=t)`` and ``predict(obs, step=t)``. Prediction also records
+the next observation if it has not yet been delivered, so either call order
+sends each control step once. Repeating the latest observation step is a no-op;
+older or skipped steps are rejected. Step identity refers to the same control
+state and instruction within one episode, not equality of image contents.
+Repeated inference without a new observation remains disallowed by the
+stateful bridge. ``end_episode()`` releases ownership for the next task.
+The adapter is local to RoboDojo; other robots and the shared VLA interfaces
+keep their existing contracts.
+
+CPU-only tests exercise the bridge, both RPC transports, toolkit execution,
+ownership, reset, cancellation and failure handling with a fake model and
+environment:
+
+.. code-block:: bash
+
+   pytest tests/unit_tests/robots/robodojo/test_policy_adapter_contracts.py \
+     tests/unit_tests/robots/robodojo/test_stateful_policy_loopback.py -v
+
+Awomo-0.5 backend
+^^^^^^^^^^^^^^^^^
+
+``--policy-backend awomo05`` uses the official XPolicyLab ``Awomo05`` model
+through the stateful RoboDojo adapter. It requires ``arx_x5`` and absolute
+``joint`` actions, and automatically enables ``run_policy``. Flash replay is
+not supported. Default startup without Awomo remains Env + SAM3.
+
+Prepare the official model environment, checkpoint and matching statistics
+using XPolicyLab's Awomo05 installation instructions. Keep model and simulator
+interpreters separate. In the model environment, start this thin launcher from
+the RPent checkout; it uses the official model and adds read-only metadata:
+
+.. code-block:: bash
+
+   export XPL_ROOT=/path/to/RoboDojo/XPolicyLab
+   export PYTHONPATH="$(dirname "$XPL_ROOT"):$XPL_ROOT:${PYTHONPATH:-}"
+   CUDA_VISIBLE_DEVICES=<free-model-gpu> /path/to/awomo/python \
+     robots/robodojo/awomo05_policy_server.py \
+     --config_path "$XPL_ROOT/policy/Awomo05/deploy.yml" \
+     --host 127.0.0.1 --port 19105 \
+     --overrides policy_name=Awomo05 bench_name=RoboDojo \
+     task_name=stack_blocks_by_language env_cfg_type=arx_x5 action_type=joint \
+     seed=0 ckpt=model.pt input_color_order=bgr replan_steps=8
+
+Use the official weight-path environment variables and model configuration.
+The launcher does not copy model code or alter inference, normalization,
+history sampling or AR state. An unmodified older service without
+``get_model_meta`` is rejected before reset; launch a dedicated compatible
+service rather than probing it with state-changing calls.
+
+Choose exactly one connection mode. For an existing official WebSocket service,
+RPent starts only a lightweight bridge. The bridge interpreter needs RPent and
+XPolicyLab's client dependencies (including WebSockets, msgpack and
+msgpack-numpy); it does not load model weights:
+
+.. code-block:: bash
+
+   rpent --robot robodojo --task stack_blocks_by_language --layout 0 \
+     --planner codex --model <planner-model> --policy-backend awomo05 \
+     --policy-server-url ws://127.0.0.1:19105 \
+     --xpolicylab-root "$XPL_ROOT" --policy-python /path/to/bridge/python \
+     --env-endpoint http://127.0.0.1:19106 --output-dir /path/to/awomo-run
+
+Alternatively, start a reusable RPent Awomo bridge with the XPolicyLab checkout
+and its parent on ``PYTHONPATH``:
+
+.. code-block:: bash
+
+   /path/to/bridge/python -m robots.robodojo.awomo05_bridge \
+     --task stack_blocks_by_language --policy-server-url ws://127.0.0.1:19105 \
+     --host 127.0.0.1 --port 19107
+
+Then replace ``--policy-server-url``, ``--xpolicylab-root`` and
+``--policy-python`` in the RPent command with
+``--vla-endpoint http://127.0.0.1:19107``. The two endpoint options are mutually
+exclusive. ``--policy-python`` aliases the existing ``--pi05-python`` option.
+Both modes validate model identity, native action layout, cameras, history,
+replanning and stateful capabilities before starting an episode. Configure
+the planner as described elsewhere on this page. Awomo runs do not start SAM3
+unless that component is explicitly requested.
+
+An independently managed model service is borrowed: RPent does not stop it.
+Give one active run exclusive access to both the environment and model service.
+The bridge's session ownership cannot prevent another official client or a
+second bridge from resetting the same upstream model.
+
+The wire observation keeps RGB ``uint8`` HWC images in the order ``cam_head``,
+``cam_left_wrist``, ``cam_right_wrist``. The released checkpoint's BGR conversion
+occurs once inside the official adapter. State packing there is left arm (6),
+left gripper (1), right arm (6), right gripper (1). Returned actions retain those
+four named fields; they never pass through Pi0.5's different flattened layout.
+Joint targets are absolute radians, with normalized gripper opening (0 closed,
+1 open) mapped by the native environment. Each control target represents 0.04 s
+of simulated time, not a wall-clock delay imposed by network inference.
+
+For Awomo, the local execution loop is the sole owner of unexecuted returned
+actions. Calls such as ``run_policy(3)`` followed by ``run_policy(5)`` consume one
+8-action chunk when the episode, instruction and environment step remain
+consistent. A scripted action drops the remainder and sends its new observation
+without resetting model history. Cancellation discards the remainder and pauses
+control; an explicit resume preserves confirmed history. Uncertain errors,
+instruction changes or unobserved advancement block control until explicit reset. Episode end drops remaining actions
+and does not send a terminal observation, matching the official deploy loop.
+Cache invalidation itself never invokes model reset. Same-step out-of-band
+resets cannot be detected from the current environment API; use exclusive
+endpoints and perform resets through the execution boundary.
+
+Run the offline regression tests without model weights:
+
+.. code-block:: bash
+
+   pytest tests/unit_tests/robots/robodojo/test_awomo05_contracts.py \
+     tests/unit_tests/robots/robodojo/test_awomo05_loopback.py \
+     tests/unit_tests/robots/robodojo/test_awomo05_policy_tool.py -v
+
+For a bounded real-model check, prepare exclusive test endpoints and run:
+
+.. code-block:: bash
+
+   RPENT_RUN_AWOMO05_INTEGRATION=1 \
+   RPENT_E2E_OUTPUT_DIR=/path/to/new-evidence \
+   RPENT_ROBODOJO_ENV_ENDPOINT=http://127.0.0.1:19106 \
+   RPENT_ROBODOJO_STEP_LIMIT=40 \
+   RPENT_AWOMO05_POLICY_SERVER_URL=ws://127.0.0.1:19105 \
+   RPENT_XPOLICYLAB_ROOT="$XPL_ROOT" \
+     pytest tests/e2e_tests/robodojo/test_awomo05.py -v -s
+
+The environment must be configured for the selected task, layout 0 and the
+specified step limit. ``RPENT_ROBODOJO_TASK`` defaults to
+``stack_blocks_by_language``, an official open task. To test a borrowed bridge,
+set ``RPENT_AWOMO05_VLA_ENDPOINT`` instead of
+``RPENT_AWOMO05_POLICY_SERVER_URL``. The test executes 3+5+2 control steps, resets
+and executes two more; it writes ``awomo05-result.json`` and closes the test
+environment. Early native success is a distinct outcome from passing this fixed
+cadence check. This test is opt-in and is not part of the GPU suite runner.
+
+Full-episode policy tool validation
+"""""""""""""""""""""""""""""""""""
+
+The Awomo toolkit exposes ``run_policy`` for robot actions, alongside
+``view_env_state`` and common audit/finish tools. It does not expose grasp,
+placement or scripted recovery tools. Its prompt keeps the original task
+instruction; RPent does not rewrite subtasks or stop when a grasp is detected.
+A budget return pauses execution while preserving valid pending actions.
+Continue until ``episode_ended`` or an execution error. A cancelled or failed
+call must not be retried automatically.
+
+For Awomo calls, ``log.result`` reports ``executed_steps``, ``observation_step``,
+``episode_ended``, ``pending_actions`` and ``stop_reason`` (``budget``,
+``episode_end``, ``cancelled`` or ``error``). Successful execution does not imply
+task success. Complete per-inference metadata is recorded in the action's
+``result.inferences`` in ``states.json``; the immediate tool response includes
+``inference_count`` instead of those details. Each inference is recorded only
+in the call that generated its chunk, even when later calls consume its tail.
+
+A bridge advertising ``action_info`` accepts ``include_info=True`` on
+``vla.get_action``. The default still returns actions, preserving existing
+clients. The Awomo client also continues to return an action list. Metadata
+contains the upstream response fields (including ``latency_ms`` when supplied),
+model result metadata and the measured ``bridge_rpc_s``. The execution report
+separately measures ``policy_rpc_s``, ``observation_rpc_s``, ``env_step_s`` and
+``elapsed_s`` in seconds. These nested wall-clock durations must not be added
+together as independent costs; ``elapsed_s`` excludes subsequent state capture
+and planner work. Setup/reset and the initial observation are outside the call.
+An older bridge without this capability remains usable and yields empty
+inference ``info``. Missing upstream timings are unavailable, not zero.
+
+To check complete task execution, use the same task, layout, checkpoint,
+configuration and native step limit as the official reference. Start exclusive
+endpoints, then run the fixed planner test:
+
+.. code-block:: bash
+
+   RPENT_RUN_AWOMO05_COMPLETE=1 \
+   RPENT_E2E_OUTPUT_DIR=/path/to/new-complete-evidence \
+   RPENT_ROBODOJO_TASK=stack_blocks_by_language \
+   RPENT_ROBODOJO_LAYOUT=13 RPENT_ROBODOJO_STEP_LIMIT=400 \
+   RPENT_POLICY_BUDGETS=3,5,31 \
+   RPENT_ROBODOJO_ENV_ENDPOINT=http://127.0.0.1:19106 \
+   RPENT_AWOMO05_POLICY_SERVER_URL=ws://127.0.0.1:19105 \
+   RPENT_XPOLICYLAB_ROOT="$XPL_ROOT" \
+     pytest tests/e2e_tests/robodojo/test_awomo05_complete.py -v -s
+
+The endpoint's layout and step limit must match these values. This opt-in test allows up to two hours. The test uses
+RPent's actual API planner and registered tools with a deterministic model;
+it retains the official instruction and permits ``finish`` only after native
+episode end. It exercises segmented continuation, checks every observation
+and inference step, writes an audit and ``complete-result.json``, and closes
+the test environment. No planner credentials or autonomous goal/recovery
+choices are involved. ``RPENT_POLICY_BUDGETS=400`` checks a single tool budget;
+``RPENT_AWOMO05_VLA_ENDPOINT`` selects a borrowed bridge as in the bounded test.
+Run each variant with a fresh episode. Compare the native termination, action
+sequence and success outcome with the official reference; a matching task name
+alone does not establish equivalent simulator semantics or model quality.
+
+Record the simulator/runtime and model source revisions separately. RPent's
+current RLinf runtime requires the packaged ``src.collect_client`` interface;
+an official source tree without that module cannot replace it using only
+``--source-root``. Runtime integration results are not official baseline success
+rates. The bounded check alone does not establish full-episode passthrough.
+
+
+The CPU regressions require neither Awomo weights nor Isaac Sim. They do not
+establish Awomo inference quality, simulator camera cadence or benchmark success.
 
 .. _robodojo-local-nvidia-assets:
 

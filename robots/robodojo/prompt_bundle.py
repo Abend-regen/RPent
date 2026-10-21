@@ -26,6 +26,20 @@ from rpent.prompt.utils import PromptNode
 def system_prompt(
     variables: Mapping[str, object] | None = None,
 ) -> PromptNode:
+    if (variables or {}).get("policy_backend") == "awomo05":
+        return {
+            "POLICY EXECUTION": system_parts.AWOMO_POLICY,
+            "REWARD AND SCORE": system_parts.REWARD,
+            "OUTPUT DISCIPLINE": system_parts.OUTPUT_DISCIPLINE,
+        }
+    if (variables or {}).get("stateful_policy"):
+        return {
+            "ROLE AND RULES": system_parts.STATEFUL_POLICY,
+            "TOOL ACCESS": system_parts.TOOL_ACCESS,
+            "AVAILABLE OPERATIONS": system_parts.TOOLS,
+            "SAFETY": system_parts.SAFETY,
+            "OUTPUT DISCIPLINE": system_parts.OUTPUT_DISCIPLINE,
+        }
     sections = {
         "ROLE AND RULES": system_parts.ROLE_AND_RULES,
         "TOOL ACCESS": system_parts.TOOL_ACCESS,
@@ -55,6 +69,13 @@ def user_prompt(
     }
     if (variables or {}).get("mode") == "eval-fair":
         return {"TASK": "{{task}} / layout {{layout}}"}
+    if (variables or {}).get("policy_backend") == "awomo05":
+        return {
+            "TASK": user_parts.TASK.replace(
+                "analytic joint targets", "Awomo05 native joint policy"
+            ),
+            "BEGIN": user_parts.POLICY_BEGIN,
+        }
     return sections
 
 

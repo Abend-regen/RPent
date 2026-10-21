@@ -230,6 +230,81 @@ def test_spawn_uses_explicit_interpreter_and_child_paths(
     )
 
 
+@pytest.mark.parametrize("backend", ["rlinf", "xpolicylab"])
+def test_runtime_connects_matching_policy_client(monkeypatch, tmp_path, backend):
+    from rpent.dashboard.events import NullDashboardEventSink
+    from rpent.robots.components.pi05_vla_client import Pi05VLAClient
+    from rpent.robots.components.xpolicylab_vla_client import XPolicyLabVLAClient
+
+    rpc = object()
+    monkeypatch.setattr(robot_spec, "_spawn_vla_server", lambda *a: (None, rpc))
+    monkeypatch.setattr(robot_spec, "try_wait_server", lambda *a, post_fn: post_fn())
+    daemons, kwargs = robot_spec._init_runtime(
+        _args("--policy-backend", backend), tmp_path, NullDashboardEventSink(), {"vla"}
+    )
+    assert daemons == []
+    client = kwargs["vla_client"]
+    assert isinstance(
+        client, Pi05VLAClient if backend == "rlinf" else XPolicyLabVLAClient
+    )
+    assert client._client is rpc
+    if backend == "rlinf":
+        assert client._embodiment == "robodojo"
+
+
+def test_stateful_policy_requires_explicit_external_xpolicy_endpoint():
+    args = _args("--stateful-policy")
+    with pytest.raises(ValueError, match="requires"):
+        robot_spec._validate_args(args)
+    args.policy_backend = "xpolicylab"
+    with pytest.raises(ValueError, match="requires"):
+        robot_spec._validate_args(args)
+    args.vla_endpoint = "http://127.0.0.1:1234"
+    robot_spec._validate_args(args)
+    args.planner = "flash"
+    with pytest.raises(ValueError, match="Flash"):
+        robot_spec._validate_args(args)
+
+
+def test_stateful_endpoint_uses_framework_sessions(monkeypatch, tmp_path):
+    calls = []
+    rpc = object()
+
+    def connect(endpoint, **kwargs):
+        calls.append((endpoint, kwargs))
+        return rpc
+
+    monkeypatch.setattr(robot_spec, "make_rpc_client", connect)
+    args = _args(
+        "--stateful-policy",
+        "--policy-backend",
+        "xpolicylab",
+        "--vla-endpoint",
+        "http://policy:1234",
+    )
+    assert robot_spec._spawn_vla_server(args, tmp_path) == (None, rpc)
+    assert calls == [("http://policy:1234", {"enable_sessions": True})]
+
+
+def test_stateful_prompt_matches_available_tools():
+    bundle = robot_spec.get_robot_spec().prompts
+    prompt = bundle.render(
+        "system",
+        variables={
+            "stateful_policy": True,
+            "output_dir": "/tmp/run",
+            "recipe_tag": "stack",
+        },
+    )
+    assert "run_policy" in prompt
+    assert "pi0_pick" not in prompt
+    default = bundle.render(
+        "system", variables={"output_dir": "/tmp/run", "recipe_tag": "stack"}
+    )
+    assert "pi0_pick" not in default
+    assert "run_policy" not in default
+
+
 @pytest.mark.parametrize("lifting_arm", ["left", "right"])
 def test_pi0_pick_monitors_both_arms_and_preserves_policy_input(lifting_arm):
     def observation(z):
@@ -459,6 +534,7 @@ def test_toolkit_exposes_new_primitives_without_legacy_actions(
         "rotate_wrist",
         "move_delta",
         "hold",
+        "run_policy",
         "set_gripper",
         "release",
     }

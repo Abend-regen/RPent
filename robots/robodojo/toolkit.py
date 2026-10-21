@@ -55,6 +55,10 @@ class RoboDojoToolkit(Toolkit):
         state_output_dir: Path | str | None = None,
     ) -> None:
         self.eval_fair = eval_fair
+        self._stateful_policy = primitives_kwargs.get("stateful_policy", False)
+        self._policy_only = primitives_kwargs.get("policy_backend") == "awomo05"
+        if self._stateful_policy and eval_fair:
+            raise ValueError("Stateful policy execution is not supported in eval-fair")
         if eval_fair and not getattr(primitives_kwargs.get("env"), "eval_fair", False):
             raise ValueError("eval-fair requires a mode-validated environment client")
         state = EnvState(Path(state_output_dir or get_output_dir()))
@@ -113,20 +117,39 @@ class RoboDojoToolkit(Toolkit):
         from robots.robodojo import tools as robodojo_tools
 
         self._pending_perception = []
+        env = primitives_kwargs["env"]
+        policy = primitives_kwargs.get("vla_client")
+        if self._stateful_policy:
+            from robots.robodojo.policy_adapter import RoboDojoPolicyAdapter
+            from robots.robodojo.stateful_policy import StatefulPolicyEnv
+
+            if policy is None:
+                raise ValueError("Stateful policy execution requires a VLA client")
+            env = StatefulPolicyEnv(
+                env,
+                RoboDojoPolicyAdapter(policy, stateful=True),
+                self.raise_if_cancelled,
+                resume_chunks=self._policy_only,
+            )
         observer = primitives_kwargs.get("execution_observer")
         if observer is not None:
             primitives_kwargs["env"].register_execution_observer(observer)
         self._state.reset()
         self._primitives = RoboDojoPrimitives(
-            env=primitives_kwargs["env"],
+            env=env,
             sam3_client=primitives_kwargs.get("sam3_client"),
             vla_client=primitives_kwargs.get("vla_client"),
             action_type=primitives_kwargs.get("action_type", "joint"),
             check_cancelled=self.raise_if_cancelled,
         )
-        self._publish_step(
-            robodojo_tools.dump_state(self._primitives, self._state, log=None)
-        )
+        try:
+            self._publish_step(
+                robodojo_tools.dump_state(self._primitives, self._state, log=None)
+            )
+        except Exception:
+            if self._stateful_policy:
+                env.end_execution()
+            raise
 
     def close(self) -> None:
         """Drain tools; the runtime owns the environment across planner sessions."""
@@ -159,6 +182,8 @@ class RoboDojoToolkit(Toolkit):
         from robots.robodojo import tools as robodojo_tools
 
         for definition in iter_tools(robodojo_tools):
+            if self._policy_only and definition.name != "view_env_state":
+                continue
             if definition.name not in OBSERVATION_TOOLS:
                 continue
             resources = {"state": self._state}
@@ -168,8 +193,19 @@ class RoboDojoToolkit(Toolkit):
                 resources["primitives"] = self._primitives
             self.add_tool(definition.with_handler(partial(definition, **resources)))
         for definition in iter_tools(self._primitives):
+            if self._policy_only and definition.name != "finish":
+                continue
             self.add_tool(definition, replace=definition.name == "finish")
-        self.add_tool(self.render)
+        if self._stateful_policy:
+            from robots.robodojo.stateful_policy import run_policy
+
+            self.add_tool(
+                run_policy.with_handler(
+                    partial(run_policy, primitives=self._primitives, state=self._state)
+                )
+            )
+        if not self._policy_only:
+            self.add_tool(self.render)
 
     @tool
     def render(self) -> ToolResult:
@@ -209,4 +245,9 @@ class RoboDojoToolkit(Toolkit):
             perception=self._pending_perception,
         )
         self._pending_perception = []
-        return robodojo_tools.view_env_state(record.step_idx, state=self._state)
+        observed = robodojo_tools.view_env_state(record.step_idx, state=self._state)
+        if self._policy_only and command.get("action") == "run_policy":
+            summary = {k: v for k, v in result.items() if k != "inferences"}
+            summary["inference_count"] = len(result.get("inferences", []))
+            observed.data["log"] = {**observed.data["log"], "result": summary}
+        return observed

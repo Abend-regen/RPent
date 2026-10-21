@@ -110,6 +110,12 @@ class RoboDojoEnvClient(BaseEnvClient):
                 raise monitor.lost(f"execution context unavailable: {exc}") from exc
             monitor.require_ready(status, instruction)
 
+    def invalidate_execution(self, reason: str) -> None:
+        """Latch control closed after the adapter reports uncertain model state."""
+        with self._execution_lock:
+            if self._execution is not None and self._execution.trusted:
+                self._execution.lost(reason)
+
     def pause_execution(self) -> None:
         with self._execution_lock:
             if self._execution is not None:

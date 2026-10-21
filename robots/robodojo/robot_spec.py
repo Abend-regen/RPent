@@ -96,6 +96,7 @@ ROBODOJO_DASHBOARD_SPEC: DashboardSpec = {
         "hold",
         "set_gripper",
         "release",
+        "run_policy",
     ),
 }
 
@@ -172,17 +173,6 @@ def finalize_run(context: RunFinalizationContext) -> Path:
     return write_json_atomic(context.output_dir / "result.json", record)
 
 
-def _validate_args(args: argparse.Namespace) -> None:
-    """Reject unsupported replay and invalid scene identity before startup."""
-    if getattr(args, "planner", None) == "flash":
-        raise ValueError(
-            "RoboDojo legacy Flash replay is unavailable with the new motion tools"
-        )
-    for name in ("seed", "layout"):
-        if getattr(args, name, 0) < 0:
-            raise ValueError(f"{name} must be nonnegative")
-
-
 def get_toolkit(
     *,
     runtime_kwargs: dict[str, Any],
@@ -229,14 +219,20 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
     )
     parser.add_argument(
         "--policy-backend",
-        choices=["rlinf", "xpolicylab"],
+        choices=["rlinf", "xpolicylab", "awomo05"],
         default="rlinf",
-        help="Legacy Pi0.5 backend for explicit VLA diagnostics; not started by default",
+        help="Select awomo05 for policy execution; default startup uses Env + SAM3",
+    )
+    parser.add_argument(
+        "--stateful-policy",
+        action="store_true",
+        help="Use continuous observations with an external stateful XPolicyLab bridge",
     )
     parser.add_argument(
         "--pi05-python",
+        "--policy-python",
         default=sys.executable,
-        help="Python executable for explicit legacy Pi0.5 diagnostics",
+        help="Policy/bridge Python executable (--pi05-python is retained)",
     )
     parser.add_argument(
         "--task",
@@ -282,16 +278,62 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         default=None,
         help="[protocol://]host:port of an existing env_server",
     )
-    parser.add_argument(
+    policy_endpoint = parser.add_mutually_exclusive_group()
+    policy_endpoint.add_argument(
         "--vla-endpoint",
         default=None,
-        help="[protocol://]host:port for explicit legacy Pi0.5 diagnostics",
+        help="[protocol://]host:port of an existing RPent VLA RPC server",
+    )
+    policy_endpoint.add_argument(
+        "--policy-server-url",
+        help="ws[s]://host:port of an existing Awomo05 policy server",
     )
     parser.add_argument(
         "--sam3-endpoint",
         default=None,
         help="[protocol://]host:port of an existing SAM3 server",
     )
+
+
+def _uses_stateful_policy(args: argparse.Namespace) -> bool:
+    return args.policy_backend == "awomo05" or getattr(args, "stateful_policy", False)
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    if getattr(args, "planner", None) == "flash":
+        raise ValueError(
+            "RoboDojo legacy Flash replay is unavailable with the new motion tools"
+        )
+    for name in ("seed", "layout"):
+        if getattr(args, name, 0) < 0:
+            raise ValueError(f"{name} must be nonnegative")
+
+    from urllib.parse import urlsplit
+
+    upstream = getattr(args, "policy_server_url", None)
+    if upstream and args.vla_endpoint:
+        raise ValueError(
+            "--vla-endpoint and --policy-server-url are mutually exclusive"
+        )
+    if upstream and args.policy_backend != "awomo05":
+        raise ValueError("--policy-server-url requires --policy-backend awomo05")
+    if args.policy_backend == "awomo05":
+        if not (upstream or args.vla_endpoint):
+            raise ValueError("awomo05 requires --vla-endpoint or --policy-server-url")
+        if args.env_cfg_type != "arx_x5" or args.action_type != "joint":
+            raise ValueError("awomo05 requires arx_x5 with absolute joint actions")
+        if upstream and (
+            urlsplit(upstream).scheme not in {"ws", "wss"}
+            or not urlsplit(upstream).hostname
+        ):
+            raise ValueError("--policy-server-url must be a ws:// or wss:// URL")
+    elif _uses_stateful_policy(args):
+        if args.policy_backend != "xpolicylab" or not args.vla_endpoint:
+            raise ValueError(
+                "--stateful-policy requires --policy-backend xpolicylab and --vla-endpoint"
+            )
+    if _uses_stateful_policy(args) and getattr(args, "planner", None) == "flash":
+        raise ValueError("--stateful-policy is not supported with Flash replay")
 
 
 def _parse_config(args: argparse.Namespace) -> RunConfig:
@@ -330,6 +372,8 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
             "task_summary": summary,
             "memory_dir": str(memory_dir),
             "mode": "eval-fair" if eval_fair else "dev",
+            "stateful_policy": _uses_stateful_policy(args),
+            "policy_backend": args.policy_backend,
         },
         task_desc={
             "task": args.task,
@@ -437,7 +481,14 @@ def _spawn_vla_server(
 ) -> tuple["ProcessDaemon | None", RpcClient]:
     """Spawn (or attach to) the RoboDojo Pi_05 VLA server."""
     if args.vla_endpoint is not None:
+        if _uses_stateful_policy(args):
+            return None, make_rpc_client(args.vla_endpoint, enable_sessions=True)
         return None, make_rpc_client(args.vla_endpoint)
+
+    if args.policy_backend == "awomo05":
+        from robots.robodojo.awomo05 import spawn_bridge
+
+        return spawn_bridge(args, output_dir)
 
     pi05_python = str(Path(args.pi05_python).expanduser())
     if not Path(pi05_python).exists():
@@ -506,13 +557,16 @@ def _init_runtime(
     dashboard_events: DashboardEventSink,
     components: set[str] | None,
 ) -> tuple[list[ProcessDaemon], dict[str, Any]]:
-    """Start Env and SAM3, or only the requested Dashboard components."""
+    """Start requested services, defaulting to Env + SAM3 or explicit stateful policy."""
     _validate_args(args)
     from robots.robodojo.env_client import RoboDojoEnvClient
+    from rpent.robots.components.pi05_vla_client import Pi05VLAClient
     from rpent.robots.components.sam3_client import Sam3Client
+    from rpent.robots.components.xpolicylab_vla_client import XPolicyLabVLAClient
 
     starters = {
         "env": lambda: _spawn_env_server(args, output_dir),
+        "vla": lambda: _spawn_vla_server(args, output_dir),
         "sam3": lambda: _spawn_sam3_server(args, output_dir),
     }
     connectors = {
@@ -538,11 +592,34 @@ def _init_runtime(
                 },
             )
         },
+        "vla": lambda rpc: {
+            "vla_client": (
+                Pi05VLAClient(rpc, embodiment="robodojo")
+                if args.policy_backend == "rlinf"
+                else _connect_awomo(rpc)
+                if args.policy_backend == "awomo05"
+                else XPolicyLabVLAClient(rpc)
+            )
+        },
         "sam3": lambda rpc: {"sam3_client": Sam3Client(rpc)},
     }
-    timeouts = {"env": 900.0, "sam3": 300.0}
-    wait_order = ("env", "sam3")
-    selected = {"env", "sam3"} if components is None else set(components)
+    timeouts = {"env": 900.0, "sam3": 300.0, "vla": 1800.0}
+    wait_order = (
+        ("vla", "env", "sam3")
+        if args.policy_backend == "awomo05"
+        else ("env", "sam3", "vla")
+    )
+    selected = (
+        set(components)
+        if components is not None
+        else (
+            {"env", "vla"}
+            if args.policy_backend == "awomo05"
+            else {"env", "sam3", "vla"}
+            if _uses_stateful_policy(args)
+            else {"env", "sam3"}
+        )
+    )
     unknown = selected.difference(starters)
     if unknown:
         raise ValueError(f"unknown RoboDojo runtime components: {sorted(unknown)}")
@@ -573,4 +650,12 @@ def _init_runtime(
 
     primitives_kwargs["action_type"] = args.action_type
     primitives_kwargs["task"] = args.task
+    primitives_kwargs["stateful_policy"] = _uses_stateful_policy(args)
+    primitives_kwargs["policy_backend"] = args.policy_backend
     return list(owned_daemons.values()), primitives_kwargs
+
+
+def _connect_awomo(rpc: RpcClient):
+    from robots.robodojo.awomo05 import Awomo05Client
+
+    return Awomo05Client(rpc)

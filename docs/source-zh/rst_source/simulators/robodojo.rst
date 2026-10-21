@@ -258,7 +258,7 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 有状态适配器协作
 ~~~~~~~~~~~~~~~~
 
-默认 Env + SAM3 工具链不需要 VLA。后续模型适配器可通过 ``env.register_execution_observer(callback)`` 注册一个同步回调，或通过 toolkit 的运行时 kwargs 传入 ``execution_observer``。注册时发送包含当前观测和状态的 ``attached`` 通知，不重置环境或模型。协作期间只能由一个 RPent 客户端持有环境控制权；其他客户端不得重置或修改同一服务。
+默认 Env + SAM3 工具链不需要 VLA。模型适配器可通过 ``env.register_execution_observer(callback)`` 注册一个同步回调，或通过 toolkit 的运行时 kwargs 传入 ``execution_observer``。注册时发送包含当前观测和状态的 ``attached`` 通知，不重置环境或模型。协作期间只能由一个 RPent 客户端持有环境控制权；其他客户端不得重置或修改同一服务。
 
 适配器每次推理前必须调用 ``env.require_policy_ready()``，并通过 ``env.step_policy(action)`` 执行自身动作。指令切换、剩余动作缓存、推理串行化及模型历史采样由适配器负责。此边界不提供 Policy 调度器、动作缓存或模型历史采样器。RoboDojo 客户端和服务端均明确禁止 ``chunk_step``；支持的动作入口逐个动作获取确认。
 
@@ -271,7 +271,169 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 
 Policy 预算暂停只需停止调用方的循环，不调用 ``pause_execution()``；同回合、同指令且环境未额外推进时可保留剩余动作。``pause_execution()`` 表示取消，会使动作缓存失效；``resume_execution()`` 只解除暂停，不能修复失同步。执行前的参数拒绝或规划失败不会使模型历史失去可信状态。环境指令变化或检测到边界外动作计数变化时，协作边界会停止接纳推理及执行。
 
-当前显式恢复方式是成功调用 ``env.reset()``，并成功交付重置事件，不会自动恢复。如果取消同时暂停了控制，还需显式恢复暂停。Eval-fair 服务禁止 reset，需开启新回合／服务。关闭 toolkit 会结束本次协作边界，后续会话须建立新的客户端／适配器。丢失响应后不重试动作。离线假适配器与仿真 primitive 检查只验证公共契约，不代表真实 Awomo 或 VPP2 已兼容；真实模型整合和完整 episode 对照另行验收。
+当前显式恢复方式是成功调用 ``env.reset()``，并成功交付重置事件，不会自动恢复。如果取消同时暂停了控制，还需显式恢复暂停。Eval-fair 服务禁止 reset，需开启新回合／服务。关闭 toolkit 会结束本次协作边界，后续会话须建立新的客户端／适配器。丢失响应后不重试动作。离线假适配器与仿真 primitive 检查只验证公共契约，不代表所有 VLA 已兼容。下文的 Awomo 接入消费此契约，完整 episode 对照仍需单独验收。
+
+有状态 XPolicyLab 策略
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+对于需要逐控制步历史观测的策略，先准备独立的 XPolicyLab WebSocket 服务，\
+实现 ``reset``、``update_obs`` 和 ``get_action``。历史缓存、预处理和动作块长度由模型适配器负责。
+请使用独立的服务和端口，避免与正在进行的评测共用。
+
+在已安装 RPent 和 XPolicyLab 客户端依赖的 Python 环境中，将 XPolicyLab 源码目录\
+加入 ``PYTHONPATH``，启动桥接：
+
+.. code-block:: bash
+
+   PYTHONPATH=/path/to/XPolicyLab python -m rpent.robots.components.xpolicylab_vla_server \
+     --task stack_blocks_by_language --stateful \
+     --policy-server-url ws://127.0.0.1:19105 \
+     --transport http --host 127.0.0.1 --port 19106
+
+按本页说明配置仿真、SAM3 和 planner 后，将 RPent 连接到桥接服务：
+
+.. code-block:: bash
+
+   rpent --robot robodojo --task stack_blocks_by_language --layout 0 \
+     --planner codex --model <planner-model> \
+     --policy-backend xpolicylab --stateful-policy \
+     --vla-endpoint http://127.0.0.1:19106 \
+     --output-dir /path/to/stateful-run
+
+此模式需显式启用，并提供外部桥接端点。默认仍只启动 Env + SAM3，不启动策略服务。
+工具列表在原生 primitive 之外新增 ``run_policy(max_steps)``，使用官方任务指令执行有限步数的动作块。
+每完成一个控制步，包括脚本动作，都会发送一次观测；读取场景或记录状态不会发送额外观测，\
+动作块边界也不会重复发送。工具包启动时重置一次模型；环境回合重置时同步清空模型历史，\
+同一回合内多次调用工具则保留历史。
+
+桥接复用 RPent RPC 会话机制，同一时刻只允许一个会话持有模型历史。\
+其他会话无法通过已占用的桥接重置模型或请求推理。持有者会话关闭或过期后释放占用；\
+工具包关闭时也会结束回合并释放占用，同时保留 VLA 连接供后续任务复用。新回合使用前必须重置。
+此机制无法隔离绕过桥接的客户端，因此上游模型服务也应专供该桥接使用。
+此模式暂不支持 Flash 回放。
+
+观测步号从零开始，必须连续。观测更新或推理失败后，该回合状态被标记为不可继续使用，\
+因为响应丢失前模型可能已经更新。环境动作结果不确定时同样停止执行，须显式重置后再使用。取消只清空剩余动作并暂停控制，不重置模型历史。不要自动重试不确定调用；planner 工具不提供回合重置操作。
+回合结束和动作执行完成均不能作为任务成功的证据。
+
+有状态执行循环使用 ``robots.robodojo.policy_adapter`` 中的 ``RoboDojoPolicyAdapter``。
+默认模式原样转发 ``predict(obs, options)``，回合与观测钩子不会额外调用后端。
+有状态模式通过 ``begin_episode(obs)`` 重置并记录第零步，随后调用 ``observe(obs, step=t)`` 和 ``predict(obs, step=t)``。若下一步观测尚未发送，\
+预测入口会先发送观测，因此两种调用顺序都只会记录一次该控制步。
+再次提交最新观测步号时不重复发送；旧步号或跳步会被拒绝。
+步号表示同一回合中的控制状态和指令，不根据图像内容判断是否重复。
+没有新观测时重复推理，仍会被有状态桥接拒绝。``end_episode()`` 释放占用，供后续任务使用。
+该适配器仅属于 RoboDojo，其他机器人和共享 VLA 接口保持现有契约。
+
+以下 CPU 测试使用假模型和假环境，覆盖桥接、两种 RPC 传输、工具执行、\
+会话占用、回合重置、取消和异常处理：
+
+.. code-block:: bash
+
+   pytest tests/unit_tests/robots/robodojo/test_policy_adapter_contracts.py \
+     tests/unit_tests/robots/robodojo/test_stateful_policy_loopback.py -v
+
+Awomo-0.5 后端
+^^^^^^^^^^^^^^^^
+
+``--policy-backend awomo05`` 通过 Robodojo 有状态适配层调用 XPolicyLab 官方 ``Awomo05`` 模型，要求使用 ``arx_x5`` 和绝对 ``joint`` 动作，并自动启用 ``run_policy``。该路径不支持 Flash replay；未选择 Awomo 时默认仍启动 Env + SAM3。
+
+先按 XPolicyLab 的 Awomo05 安装说明准备独立模型环境、权重及匹配的统计量，模型与仿真使用不同解释器。在 RPent 仓库根目录，用模型环境启动薄包装服务：
+
+.. code-block:: bash
+
+   export XPL_ROOT=/path/to/RoboDojo/XPolicyLab
+   export PYTHONPATH="$(dirname "$XPL_ROOT"):$XPL_ROOT:${PYTHONPATH:-}"
+   CUDA_VISIBLE_DEVICES=<free-model-gpu> /path/to/awomo/python \
+     robots/robodojo/awomo05_policy_server.py \
+     --config_path "$XPL_ROOT/policy/Awomo05/deploy.yml" \
+     --host 127.0.0.1 --port 19105 \
+     --overrides policy_name=Awomo05 bench_name=RoboDojo \
+     task_name=stack_blocks_by_language env_cfg_type=arx_x5 action_type=joint \
+     seed=0 ckpt=model.pt input_color_order=bgr replan_steps=8
+
+沿用官方权重路径环境变量和模型配置。该启动器复用官方模型，仅增加只读元信息，不复制模型代码，也不改变推理、归一化、历史采样或 AR 状态。缺少 ``get_model_meta`` 的旧服务会在 reset 前被拒绝；应启动独立的兼容服务，不使用改变状态的调用探测能力。
+
+连接模式二选一。连接已有官方 WebSocket 服务时，RPent 只启动轻量桥接；桥接解释器需要安装 RPent 和 XPolicyLab 客户端依赖，包括 WebSockets、msgpack 和 msgpack-numpy，无需加载模型权重：
+
+.. code-block:: bash
+
+   rpent --robot robodojo --task stack_blocks_by_language --layout 0 \
+     --planner codex --model <planner-model> --policy-backend awomo05 \
+     --policy-server-url ws://127.0.0.1:19105 \
+     --xpolicylab-root "$XPL_ROOT" --policy-python /path/to/bridge/python \
+     --env-endpoint http://127.0.0.1:19106 --output-dir /path/to/awomo-run
+
+也可预先启动可复用的 RPent Awomo 桥接；将 XPolicyLab 目录及其父目录加入 ``PYTHONPATH``：
+
+.. code-block:: bash
+
+   /path/to/bridge/python -m robots.robodojo.awomo05_bridge \
+     --task stack_blocks_by_language --policy-server-url ws://127.0.0.1:19105 \
+     --host 127.0.0.1 --port 19107
+
+随后将 RPent 命令中的 ``--policy-server-url``、``--xpolicylab-root`` 和 ``--policy-python`` 替换为 ``--vla-endpoint http://127.0.0.1:19107``。两类端点参数互斥。``--policy-python`` 是现有 ``--pi05-python`` 的别名。两种模式都会在回合开始前检查模型身份、原生动作布局、相机、历史、重规划和有状态能力。使用 CLI 时，按本页其他章节配置 planner；Awomo 默认不启动 SAM3。
+
+独立模型服务属于借用资源，RPent 退出时不会停止它。一个运行任务应独占环境和模型服务；桥接的会话锁无法阻止另一官方客户端或另一桥接重置同一个上游模型。
+
+观测在线路上传输为 RGB、``uint8``、HWC 图像，顺序为 ``cam_head``、``cam_left_wrist``、``cam_right_wrist``。发布权重所需的 BGR 换序仅在官方 adapter 内发生一次。官方状态打包顺序为左臂 6 维、左夹爪 1 维、右臂 6 维、右夹爪 1 维；返回动作保留这四个具名字段，不经过 Pi0.5 的不同扁平向量布局。关节目标为绝对弧度值，夹爪开度为 0 关闭、1 张开，由原生环境映射为实际关节量。每个控制目标对应 0.04 秒仿真时间，不以网络推理耗时决定控制频率。
+
+Awomo 路径中，本地执行层是已返回、尚未执行动作的唯一缓存持有者。在回合、指令和环境步数保持一致时，先 ``run_policy(3)`` 再 ``run_policy(5)`` 会执行同一组 8 步动作。脚本动作清空剩余动作并补送新观测，保留模型历史。取消会清空剩余动作并暂停控制，显式恢复暂停后保留已确认历史。结果不确定的异常、换指令或检测到环境绕过执行层推进时，阻止继续执行，直到显式重置回合。回合结束时清空动作且不再发送终止观测，与官方部署循环一致。清空缓存本身不会调用模型 reset。现有环境接口无法识别步数未变的外部 reset，因此必须使用独占端点并通过执行层重置。
+
+无需模型权重即可运行离线回归：
+
+.. code-block:: bash
+
+   pytest tests/unit_tests/robots/robodojo/test_awomo05_contracts.py \
+     tests/unit_tests/robots/robodojo/test_awomo05_loopback.py \
+     tests/unit_tests/robots/robodojo/test_awomo05_policy_tool.py -v
+
+准备独占的测试端点后，运行真实模型的有界验证：
+
+.. code-block:: bash
+
+   RPENT_RUN_AWOMO05_INTEGRATION=1 \
+   RPENT_E2E_OUTPUT_DIR=/path/to/new-evidence \
+   RPENT_ROBODOJO_ENV_ENDPOINT=http://127.0.0.1:19106 \
+   RPENT_ROBODOJO_STEP_LIMIT=40 \
+   RPENT_AWOMO05_POLICY_SERVER_URL=ws://127.0.0.1:19105 \
+   RPENT_XPOLICYLAB_ROOT="$XPL_ROOT" \
+     pytest tests/e2e_tests/robodojo/test_awomo05.py -v -s
+
+环境需使用所选任务、layout 0 和指定步数上限。``RPENT_ROBODOJO_TASK`` 默认为官方 open 任务 ``stack_blocks_by_language``。验证已有桥接时，用 ``RPENT_AWOMO05_VLA_ENDPOINT`` 替代 ``RPENT_AWOMO05_POLICY_SERVER_URL``。测试执行 3+5+2 步、重置后再执行 2 步，写出 ``awomo05-result.json`` 并关闭测试环境。任务提前成功与通过该固定节奏检查是不同结果。此测试需显式启用，未接入通用 GPU 套件运行器。
+
+完整回合的 Policy 工具验证
+""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+Awomo 工具包通过 ``run_policy`` 执行动作，同时保留 ``view_env_state`` 和公共审计、结束工具，不暴露抓取、放置或脚本恢复工具。提示词保留原始任务指令，RPent 不改写子任务，也不因检测到抓取而停止。步数预算用尽后暂停，保留仍有效的剩余动作，后续调用继续执行，直到 ``episode_ended`` 或执行出错。取消或失败后不得自动重试。Awomo 默认不启动 SAM3，只有显式请求该组件时才启动。
+
+Awomo 工具返回的 ``log.result`` 包含 ``executed_steps``、``observation_step``、``episode_ended``、``pending_actions`` 和 ``stop_reason``。停止原因分别为预算用尽（``budget``）、回合结束（``episode_end``）、取消（``cancelled``）或错误（``error``）。执行完成不等于任务成功。
+每次推理的完整元数据保存在 ``states.json`` 对应动作的 ``result.inferences`` 中；即时工具响应以 ``inference_count`` 提供简要计数。动作块跨工具调用续接时，仅在生成该动作块的调用中记录一次推理。
+
+声明 ``action_info`` 能力的桥接支持在 ``vla.get_action`` 中传入 ``include_info=True``。默认仍返回动作，Awomo 客户端的动作列表返回方式也保持兼容。元数据保留上游响应字段（包括服务提供的 ``latency_ms``）、模型结果元数据及桥接测量的 ``bridge_rpc_s``。
+执行报告另行记录以秒为单位的 ``policy_rpc_s``、``observation_rpc_s``、``env_step_s`` 和 ``elapsed_s``。这些墙钟耗时存在包含关系，不能作为独立开销相加；``elapsed_s`` 不包括之后的状态记录和 planner 工作，初始化、reset 与初始观测也不属于本次调用。旧桥接未声明该能力时仍可使用，推理 ``info`` 为空。缺失的上游耗时表示不可用，不补零。
+
+完整任务验证应采用与官方参考一致的任务、layout、权重、配置和原生步数上限。启动独占端点后运行固定 planner 测试：
+
+.. code-block:: bash
+
+   RPENT_RUN_AWOMO05_COMPLETE=1 \
+   RPENT_E2E_OUTPUT_DIR=/path/to/new-complete-evidence \
+   RPENT_ROBODOJO_TASK=stack_blocks_by_language \
+   RPENT_ROBODOJO_LAYOUT=13 RPENT_ROBODOJO_STEP_LIMIT=400 \
+   RPENT_POLICY_BUDGETS=3,5,31 \
+   RPENT_ROBODOJO_ENV_ENDPOINT=http://127.0.0.1:19106 \
+   RPENT_AWOMO05_POLICY_SERVER_URL=ws://127.0.0.1:19105 \
+   RPENT_XPOLICYLAB_ROOT="$XPL_ROOT" \
+     pytest tests/e2e_tests/robodojo/test_awomo05_complete.py -v -s
+
+端点的 layout 和步数上限需与命令一致。此显式启用的测试允许最多两小时。测试使用实际 RPent API planner 和工具分发链，以确定性模型固定调度，保留官方指令，仅在原生回合结束后调用 ``finish``。它验证分段续接、逐步观测和推理时点，写出审计文件与 ``complete-result.json``，随后关闭测试环境。此过程不需要 planner 凭证，不包含自主目标选择或恢复决策。设 ``RPENT_POLICY_BUDGETS=400`` 可验证单次工具预算；与有界测试一样，``RPENT_AWOMO05_VLA_ENDPOINT`` 可选择已有桥接。每种方式均使用新回合，对照官方参考的终止、动作序列和任务结果；仅任务名相同不能证明模拟器语义等价或模型质量。
+
+分别记录仿真运行时和模型源码版本。RPent 当前 RLinf 运行时要求打包源码中的 ``src.collect_client`` 接口；缺少该模块的官方源码不能仅通过 ``--source-root`` 替换。运行时接入结果不等于官方基线成功率。仅有界验证不足以证明完整回合透传或官方基线成功率。
+
+
+CPU 回归测试不需要 Awomo 权重或 Isaac Sim，也不能证明 Awomo 推理质量、\
+仿真相机刷新频率或基准任务成功率。
 
 .. _robodojo-local-nvidia-assets:
 

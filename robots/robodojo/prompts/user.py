@@ -27,3 +27,7 @@ TASK = """- task:   {{task}}
 BEGIN = """Call `view_env_state` first to read the instruction and observe the
 scene. Localize relevant targets, act through the registered primitives,
 inspect execution feedback, and record the outcome before finishing."""
+
+
+POLICY_BEGIN = """Read the original task instruction with `view_env_state`, then
+execute `run_policy` until the environment ends the episode or an error occurs."""
