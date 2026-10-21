@@ -283,6 +283,9 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         help="[protocol://]host:port of an existing env_server",
     )
     parser.add_argument(
+        "--vla-backend", choices=("vpp2",), default="vpp2", help="VLA policy backend"
+    )
+    parser.add_argument(
         "--vla-model-path",
         default=os.environ.get("VPP2_MODEL_PATH"),
         help="VPP2 resource root containing policy/ and checkpoints/ (or VPP2_MODEL_PATH)",
@@ -553,9 +556,10 @@ def _init_runtime(
     from robots.robodojo.vpp2_client import VPP2Client
     from rpent.robots.components.sam3_client import Sam3Client
 
+    vla_starter = {"vpp2": _spawn_vpp2_server}[args.vla_backend]
     starters = {
         "env": lambda: _spawn_env_server(args, output_dir),
-        "vla": lambda: _spawn_vpp2_server(args, output_dir),
+        "vla": lambda: vla_starter(args, output_dir),
         "sam3": lambda: _spawn_sam3_server(args, output_dir),
     }
     connectors = {

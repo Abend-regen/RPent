@@ -159,7 +159,8 @@ NVIDIA 驱动版本建议参考 `Isaac Sim 5.1 官方系统要求 <https://docs.
 VLA 配置
 --------
 
-常规 CLI 默认启动 Env、SAM3 和 VPP2。运行任务前准备 VPP2 资源目录，或通过
+常规 CLI 默认启动 Env、SAM3 和 VPP2。``--vla-backend vpp2`` 选择策略后端；
+``vpp2`` 是默认值，也是目前唯一支持的值。运行任务前准备 VPP2 资源目录，或通过
 ``--vla-endpoint socket://host:port`` 连接已有服务。资源缺失时明确报错，不回退到 Pi0.5 或纯解析式执行。开发者仅检查环境时，可单独选择 Env 组件。
 
 接入针对官方
