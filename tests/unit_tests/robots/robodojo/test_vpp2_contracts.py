@@ -302,11 +302,10 @@ def test_inference_failure_keeps_completed_chunk_counts(connected):
     assert env.policy_observation()["inference_index"] == 2
 
 
-def test_toolkit_registers_policy_records_artifacts_and_exports_subtask(
+def test_toolkit_registers_policy_and_persists_subtask_without_recipe_export(
     connected, tmp_path, monkeypatch
 ):
     import json
-    from pathlib import Path
 
     from robots.robodojo.toolkit import RoboDojoToolkit
     from rpent.dashboard.events import NullDashboardEventSink
@@ -334,10 +333,13 @@ def test_toolkit_registers_policy_records_artifacts_and_exports_subtask(
         assert "history" not in record.result
         assert toolkit._state.load("cam_head.png").shape == (2, 3, 3)
         rpc.success = True
-        recipe = Path(toolkit.write_recipe("example")).read_text()
-        entry = json.loads(recipe)
+        manifest = json.loads((tmp_path / "states.json").read_text())
+        entry = manifest["steps"][-1]["command"]
         assert entry["action"] == "vpp2_act"
         assert entry["instruction"] == "pick the red block"
+        assert manifest["steps"][-1]["result"]["executed_actions"] == 24
+        assert toolkit.write_recipe("example") is None
+        assert not (tmp_path / "example_recipe.jsonl").exists()
     finally:
         toolkit.close()
 
