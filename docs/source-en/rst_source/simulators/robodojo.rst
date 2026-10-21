@@ -181,7 +181,9 @@ For offline use or repeated resource-loading failures, see
 VLA Configuration
 -----------------
 
-Normal CLI startup loads Env, SAM3 and VPP2. Prepare a VPP2 resource root
+Normal CLI startup loads Env, SAM3 and VPP2. ``--vla-backend vpp2`` selects
+the policy backend; ``vpp2`` is the default and the only supported value.
+Prepare a VPP2 resource root
 before starting a task, or connect an existing service with
 ``--vla-endpoint socket://host:port``. Missing resources are an error, not a
 fallback to Pi0.5 or analytic-only execution. Component-only developer runs

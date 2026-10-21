@@ -440,7 +440,10 @@ def test_facade_rejects_bad_request_before_model_execution(connected, facade, ch
     assert not calls
 
 
-def test_local_vpp2_missing_resources_fail_before_starting_env(monkeypatch, tmp_path):
+@pytest.mark.parametrize("backend_args", [[], ["--vla-backend", "vpp2"]])
+def test_local_vpp2_missing_resources_fail_before_starting_env(
+    monkeypatch, tmp_path, backend_args
+):
     import argparse
 
     from robots.robodojo import robot_spec
@@ -449,7 +452,12 @@ def test_local_vpp2_missing_resources_fail_before_starting_env(monkeypatch, tmp_
     monkeypatch.delenv("VPP2_MODEL_PATH", raising=False)
     parser = argparse.ArgumentParser()
     robot_spec._add_cli_args(parser, False)
-    args = parser.parse_args(["--task", "put_bottles_into_dustbin"])
+    args = parser.parse_args(["--task", "put_bottles_into_dustbin", *backend_args])
+    assert args.vla_backend == "vpp2"
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--task", "put_bottles_into_dustbin", "--vla-backend", "unknown"]
+        )
     monkeypatch.setattr(
         robot_spec, "_spawn_env_server", lambda *args: pytest.fail("env started")
     )
