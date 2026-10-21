@@ -1,13 +1,7 @@
 RoboDojo
 ========
 
-通过 RPent 工具控制 RoboDojo 双臂桌面场景。仿真器基于 Isaac Sim / IsaacLab，采用 ARX-X5 双机械臂平台。
-
-.. note::
-
-   解析式工具调用原生 cuRobo 位姿规划，并执行关节目标。规划器默认障碍物模型只有简化桌面，未包含全部物体或另一只机械臂。路径规划及抽样不能保证执行时无碰撞。组件检查和有界动作执行检查不能说明基准任务成功率。
-
-   ``pi0_pick``、``stabilize`` 和 ``place_in_bin`` 不注册。默认加载 VPP2，不加载 Pi0.5；Flash 重放仍不可用。
+通过 RPent 在 RoboDojo 中执行双臂桌面操作任务。仿真器基于 Isaac Sim / IsaacLab，采用 ARX-X5 双机械臂平台。RPent 结合 VPP2 策略动作、原生运动 Primitive 和 SAM3 物体分割完成任务。
 
 概览
 ----
@@ -130,8 +124,8 @@ NVIDIA 驱动版本建议参考 `Isaac Sim 5.1 官方系统要求 <https://docs.
 .. code-block:: bash
 
    hf download RoboDojo-Benchmark/RoboDojo --repo-type dataset \
-     --include 'Assets/**' --local-dir /data/robodojo
-   export ROBODOJO_ASSETS_ROOT=/data/robodojo
+     --include 'Assets/**' --local-dir /path/to/robodojo
+   export ROBODOJO_ASSETS_ROOT=/path/to/robodojo
 
 下载后，目录中应有 ``Assets/Robots``、``Assets/Object``、``Assets/Material`` 和 ``Assets/Eval_Layout``。
 
@@ -159,17 +153,23 @@ NVIDIA 驱动版本建议参考 `Isaac Sim 5.1 官方系统要求 <https://docs.
 VLA 配置
 --------
 
-常规 CLI 默认启动 Env、SAM3 和 VPP2。``--vla-backend vpp2`` 选择策略后端；
-``vpp2`` 是默认值，也是目前唯一支持的值。运行任务前准备 VPP2 资源目录，或通过
-``--vla-endpoint socket://host:port`` 连接已有服务。资源缺失时明确报错，不回退到 Pi0.5 或纯解析式执行。开发者仅检查环境时，可单独选择 Env 组件。
+VPP2 是默认动作模型，通过 ``--vla-backend vpp2`` 选择。准备官方 `VPP2 RoboDojo 实现 <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_ 和 `Haodong082399/VPP2 <https://huggingface.co/Haodong082399/VPP2>`_ 发布的配对 100k 权重。资源目录可以自行选择；以下以 ``/path/to/vpp2`` 为例，使用时替换为自己的目录：
 
-接入针对官方
-`VPP2 RoboDojo 实现 <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_。
-源码放在 ``policy/``，权重保留官方 ``checkpoints/`` 布局；已有资源可通过软链接复用：
+.. code-block:: bash
+
+   export VPP2_MODEL_PATH=/path/to/vpp2
+   git clone --no-checkout https://github.com/roboterax/video-prediction-policy-2.git \
+     "$VPP2_MODEL_PATH/policy"
+   git -C "$VPP2_MODEL_PATH/policy" checkout 72c17acf022494ff63617be86079bb92e92f5bf8
+   hf download Haodong082399/VPP2 --local-dir "$VPP2_MODEL_PATH" \
+     --include 'checkpoints/joint2b_s100000/**' \
+     --include 'checkpoints/Wan2.1-I2V-14B-480P/**'
+
+资源根目录采用以下布局，子目录可以通过软链接复用已有资源：
 
 .. code-block:: text
 
-   /data/vpp2/
+   vpp2/
    ├── policy/src/vpp2/policy.py
    └── checkpoints/
        ├── joint2b_s100000/
@@ -178,28 +178,16 @@ VLA 配置
        │   └── dataset_stats.json
        └── Wan2.1-I2V-14B-480P/
 
-从 `Haodong082399/VPP2 <https://huggingface.co/Haodong082399/VPP2>`_ 下载完整的配对 100k 权重包（含配套文件）和共享编码器。按固定版本的
-`推理环境说明 <https://github.com/roboterax/video-prediction-policy-2/blob/72c17acf022494ff63617be86079bb92e92f5bf8/docs/robodojo.md#policy-environment>`_ 准备模型依赖。
-仿真 extra 不包含 VPP2 模型依赖。不要为模型覆盖仿真环境固定的 Torch 栈；可在独立模型环境中安装 RPent 核心包并启动服务：
+按固定版本的 `推理环境说明 <https://github.com/roboterax/video-prediction-policy-2/blob/72c17acf022494ff63617be86079bb92e92f5bf8/docs/robodojo.md#policy-environment>`_ 安装模型依赖。这些依赖与 ``.[robodojo-sim]`` 分开安装。模型依赖与 RPent 环境兼容时，设置 ``VPP2_MODEL_PATH`` 即可自动启动本地服务，``--vla-model-path`` 可覆盖该路径。本地服务使用 RPent 当前的 Python 解释器，在单张 GPU 上加载完整模型。
+
+若使用独立模型环境，在该环境中安装策略依赖和 RPent 核心包，然后启动服务：
 
 .. code-block:: bash
 
-   # 在已准备模型依赖、安装 RPent 的环境中：
-   python -m robots.robodojo.vpp2_server --model-path /data/vpp2 \
+   python -m robots.robodojo.vpp2_server --model-path /path/to/vpp2 \
      --host 127.0.0.1 --port 9201
 
-   # 在 RPent／仿真环境的任务命令后添加：
-   # --vla-endpoint socket://127.0.0.1:9201
-
-若模型依赖与当前解释器兼容，设置 ``VPP2_MODEL_PATH=/data/vpp2`` 或 ``--vla-model-path /data/vpp2`` 即可自动启动本地服务。本地 VPP2 使用当前解释器；``--sim-python`` 只选择仿真解释器。连接已有服务时，RPent 不负责关闭该服务。
-
-Agent 通过 ``vpp2_act(instruction, chunks=1)`` 明确传入当前子任务；环境原始任务指令和成功判定不变。每次推理预测 32 个双臂 EE16 绝对目标（每臂 xyz、wxyz 和夹爪），通过原生 EE 控制执行前 24 步；请求更多 chunk 时重新观测、重新预测。这里不会为每个目标调用解析式 ``move_to`` 规划器。
-
-环境客户端保存初始 RGB 锚点和最近最多 177 个时刻的三路 RGB。每次真实原生动作都会更新历史，包括解析式动作；看图和 ``render`` 不增加动作时刻。每次请求发送锚点及截至当前的 8 个采样时刻，相邻间隔 25 个动作；早期不足的时刻使用锚点。若每路均为 640×480，uint8 缓存每回合约 469 MiB，不会随运行时长无限增长；缓存不保留深度或完整观测。
-
-模型服务使用官方图像拼接、历史量化和归一化。推理随机种子按回合内序号递增，切换子任务不清空历史或重置序号，真实 reset 才清空。动作执行不确定或反馈缺失后，策略历史失效，直到 reset；看图刷新不能补齐丢失帧。正式评测不开放 reset。
-
-公开权重能够接收子任务字符串，不代表已验证其子任务成功率。默认服务在单张 GPU 上加载完整模型，不会跨卡分配权重；其他部署方式可通过独立服务端点接入。不宣称基准成绩提升。旧 Pi0.5 诊断代码保留，但其参数不选择默认 VLA，也不注册旧动作工具。
+在 RPent／仿真环境的任务命令中添加 ``--vla-endpoint socket://127.0.0.1:9201``。RPent 负责启动和关闭自己创建的模型进程；独立启动的服务由其启动者管理。远端部署见 :doc:`../guides/advanced_deployment`。
 
 SAM3 配置
 ---------
@@ -209,8 +197,8 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 
 .. code-block:: bash
 
-   hf download facebook/sam3 sam3.pt --local-dir /data/sam3
-   export SAM3_CHECKPOINT_PATH=/data/sam3/sam3.pt
+   hf download facebook/sam3 sam3.pt --local-dir /path/to/sam3
+   export SAM3_CHECKPOINT_PATH=/path/to/sam3/sam3.pt
 
 也可以从 `ModelScope <https://modelscope.cn/models/facebook/sam3>`_ 下载同一文件，\
 再将 ``SAM3_CHECKPOINT_PATH`` 指向本地文件。
@@ -225,19 +213,18 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 
    rpent-check-llm --planner codex --model <planner-model> --json
 
-将 ``<planner-model>`` 替换为所选模型名，配置好 VPP2 和 SAM3 后运行瓶子入桶任务。此命令会让 Agent 控制双臂动作：
+将 ``<planner-model>`` 替换为所选模型名，配置好 VPP2 和 SAM3 后，在 seed 组 0、layout 0 上运行瓶子入桶任务：
 
 .. code-block:: bash
 
-   # 临时处理：当前 RPent 会优先导入仓库旁的 rlinf，可能覆盖已安装的 RoboDojo 集成版。
-   # 指向当前已激活环境的 site-packages，让子服务使用该环境安装的 RLinf。
-   # 后续修正 RPent 的默认导入路径后，可移除此设置。
+   # 使用当前环境中安装的 RLinf 集成。
    export RPENT_RLINF_ROOT="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
 
    export ROBODOJO_PLACEMENT_SETTLE_STEPS=1000  # 推荐：让物体充分稳定；不设置时默认等待 20 步
    export OMNI_KIT_ACCEPT_EULA=YES  # 推荐用于首次非交互启动，提前接受 Kit 许可；已接受时可省略
    # Isaac Sim 启动需数十秒，首次运行还会编译 shader
-   rpent --robot robodojo --task put_bottles_into_dustbin --layout 0 \
+   rpent --robot robodojo --vla-backend vpp2 \
+     --task put_bottles_into_dustbin --seed 0 --layout 0 \
      --planner codex --model <planner-model> --reasoning-effort medium \
      --max-turns 40 --planner-timeout-s 1500 \
      --output-dir /path/to/run-output
@@ -256,8 +243,8 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 - ``run.log`` 和 ``transcript_*.json``：主进程日志、planner 对话和错误。
 
 先检查 ``environment_result_available=true`` 和\
-``agent_error_present=false``，再看 ``success`` 是否为 ``true``。服务正常退出或 planner\
-调用 ``finish``，均不能单独说明任务成功。
+``agent_error_present=false``，再看 ``success`` 是否为 ``true``。该字段记录 RoboDojo 的原生任务判定，\
+``finish`` 用于结束规划循环。
 
 未指定输出目录时，结果保存在 ``logs/<timestamp>_robodojo_<task>_s<seed>_l<layout>/``。并发运行应使用不同目录。\
 实时查看方式见 :doc:`../guides/dashboard`。
@@ -265,12 +252,13 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 常用参数
 --------
 
-默认由 RPent 在当前 Python 环境中启动仿真、SAM3 和 VPP2 服务。仿真器安装在独立环境时，指定 ``--sim-python``。\
-``--pi05-python`` 不选择 VPP2 的解释器。
+默认由 RPent 在当前 Python 环境中启动仿真、SAM3 和 VPP2 服务。仿真器安装在独立环境时，指定 ``--sim-python``。
 
 - ``--task``、``--seed``（默认 0）和 ``--layout``：选择任务、官方布局组和组内布局编号；传入 ``--random`` 时忽略 ``--layout``，\
   每次重置重新采样随机场景。
 - ``--cuda-device``：为本地启动的服务选择 GPU；省略时沿用 ``CUDA_VISIBLE_DEVICES``。
+- ``--vla-backend``：选择动作模型，目前支持 ``vpp2``。
+- ``--vla-model-path``：覆盖 ``VPP2_MODEL_PATH``，指向包含 ``policy/`` 和 ``checkpoints/`` 的资源根目录。
 - ``--env-endpoint``、``--sam3-endpoint``、``--vla-endpoint``：连接已有服务。\
   VLA 服务必须实现本适配器的 VPP2 协议。
 - ``--source-root``：使用本地 RoboDojo 源码替代包内源码。
@@ -283,15 +271,19 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 
 规划器不能重置回合；探索模式和 Flash 重放不可用。
 
+``vpp2_act(instruction, chunks=1)`` 执行指定子任务。每个 chunk 预测 32 个双臂 EE16 绝对目标（每臂 xyz、wxyz 和夹爪），通过原生 EE 控制执行前 24 步，再重新推理。VPP2 使用初始 RGB 帧和间隔为 25 个动作的 8 个历史采样。策略动作和 Primitive 动作都会更新历史，切换子任务时保留历史；看图和 ``render`` 不增加动作时刻。动作反馈缺失后，策略历史失效，直到 reset；无法 reset 时，需开始新回合才能恢复 VPP2。
+
 ``view_env_state`` 读取保存的图像和状态，``render`` 刷新观测。``sample_world_xyz(view, pixels, step=None, neighborhood=1)`` 查询 [行,列] 像素，默认取 3×3 邻域。``query_world_map`` 查询半开区间 [r0,c0,r1,c1]，默认最多返回 256 个点。view 使用 ``head``、``left_wrist`` 或 ``right_wrist``，必须与选点图像的视角及步号一致。查询读取保存的同帧深度，不暗中刷新；无效深度被排除，返回的是可见表面坐标，不是物体中心。
 
 ``segment`` 和 ``back_project`` 也接受 ``step``。分割返回质心 ``centroid_rc`` 和掩码内像素 ``point_rc``；凹形掩码的质心可能在物体外，反投影应优先使用 ``point_rc`` 及返回的 ``step_idx``。这两个工具保留相机名 ``cam_head``、``cam_left_wrist``、``cam_right_wrist``。
 
-调用 ``segment(text_prompt=...)`` 时，描述可见的颜色、形状和位置。工具返回红色掩码叠加图；使用定位点前先检查叠加图，高分不代表选中了正确物体。分割失败时可修改描述，或在同一历史帧中手动选取可见像素查询。叠加图和几何结果保存在对应帧中。与 LIBERO 的接口不同，这里不接受点提示，也不返回掩码区域的世界坐标中位数；选定掩码内像素后需调用 ``back_project``。
+调用 ``segment(text_prompt=...)`` 时，描述可见的颜色、形状和位置。工具返回红色掩码叠加图；使用定位点前先检查叠加图，高分不代表选中了正确物体。分割失败时可修改描述，或在同一历史帧中手动选取可见像素查询。叠加图和几何结果保存在对应帧中。使用 ``back_project`` 获取选定掩码内像素的世界坐标。
+
+运动 Primitive 使用原生 cuRobo 位姿规划并执行关节目标。规划器的障碍物模型包含简化桌面，未完整表示场景物体和另一只机械臂；选择路点时应为它们留出空间。
 
 ``move_to(arm, xyz, quat=None, gripper=None, substeps=25)`` 使用世界坐标、米及 wxyz 四元数；省略姿态或夹爪参数则保持对应状态／目标。``substeps`` 限制路径抽样数，0 保留完整路径，1 仅取最后路点，不代表速度或物理步数。``rotate_wrist`` 绕世界 Z 轴相对旋转，单位为度。``final_dist_m`` 是实测位置误差，不是到达保证。检查 ``completed``、``executed_steps`` 和 ``stop_reason``；超时的动作可能已在服务端执行，不会自动重试。
 
-``set_gripper(arm, val, steps=10)`` 使用 0=闭、1=开，``release`` 默认开到 1。中间值是连续控制目标，不保证对应精确物理宽度；反馈读取实际关节，而非命令字段。仅当实测值因物理超调越界时，将插值起点限制在合法范围，用户非法输入仍被拒绝。其他关节目标保持不变，每次下发目标还会经过底层插值。
+``set_gripper(arm, val, steps=10)`` 使用 0=闭、1=开，``release`` 默认开到 1。中间值表示归一化开度目标，而非物理宽度。反馈读取实测关节状态，夹爪运动期间保持其他关节目标不变。
 
 .. _robodojo-local-nvidia-assets:
 
@@ -307,33 +299,33 @@ RoboDojo 场景还会引用 NVIDIA 提供的三维模型、材质和贴图。这
 场景能正常加载时，可跳过本节，无需下载本地资产包，也不用设置 ``ROBODOJO_USD_ASSET_PREFIX``。
 
 以下步骤用于准备 ``Assets/Isaac/5.0`` 路径对应的本地资源。完整资产包的三个分卷合计约 150 GB，并非单个 RoboDojo 场景所需的下载量；\
-合并和解压还需额外空间。离线机器可先在能联网的机器上下载，再将分卷复制到 ``/data/nvidia``。
+合并和解压还需额外空间。离线机器可先在能联网的机器上下载，再将分卷复制到 ``/path/to/nvidia-assets``。
 
 .. code-block:: bash
 
-   mkdir -p /data/nvidia
+   mkdir -p /path/to/nvidia-assets
 
    # 下载三个分卷，已有下载可断点续传
-   wget -c -P /data/nvidia \
+   wget -c -P /path/to/nvidia-assets \
      https://download.isaacsim.omniverse.nvidia.com/isaac-sim-assets-complete-5.0.0.zip.001 \
      https://download.isaacsim.omniverse.nvidia.com/isaac-sim-assets-complete-5.0.0.zip.002 \
      https://download.isaacsim.omniverse.nvidia.com/isaac-sim-assets-complete-5.0.0.zip.003
 
    # 合并并解压，保留 Assets/Isaac/5.0 目录结构
-   cat /data/nvidia/isaac-sim-assets-complete-5.0.0.zip.001 \
-       /data/nvidia/isaac-sim-assets-complete-5.0.0.zip.002 \
-       /data/nvidia/isaac-sim-assets-complete-5.0.0.zip.003 \
-     > /data/nvidia/isaac-sim-assets-complete-5.0.0.zip
-   unzip /data/nvidia/isaac-sim-assets-complete-5.0.0.zip -d /data/nvidia
+   cat /path/to/nvidia-assets/isaac-sim-assets-complete-5.0.0.zip.001 \
+       /path/to/nvidia-assets/isaac-sim-assets-complete-5.0.0.zip.002 \
+       /path/to/nvidia-assets/isaac-sim-assets-complete-5.0.0.zip.003 \
+     > /path/to/nvidia-assets/isaac-sim-assets-complete-5.0.0.zip
+   unzip /path/to/nvidia-assets/isaac-sim-assets-complete-5.0.0.zip -d /path/to/nvidia-assets
 
-   test -d /data/nvidia/Assets/Isaac/5.0/Isaac
-   test -d /data/nvidia/Assets/Isaac/5.0/NVIDIA
+   test -d /path/to/nvidia-assets/Assets/Isaac/5.0/Isaac
+   test -d /path/to/nvidia-assets/Assets/Isaac/5.0/NVIDIA
 
 在运行 RPent 的终端中设置以下变量，再运行任务：
 
 .. code-block:: bash
 
-   export ROBODOJO_USD_ASSET_PREFIX=/data/nvidia
+   export ROBODOJO_USD_ASSET_PREFIX=/path/to/nvidia-assets
 
 这会将 RoboDojo 匹配的 5.0 在线资源地址改为本地路径。它并不代表所有 Isaac Sim 资源均可离线使用；\
 若仍有其他在线资源加载失败（例如 ``Assets/Isaac/5.1`` 路径），需另外准备对应版本的资产并配置本地加载，\

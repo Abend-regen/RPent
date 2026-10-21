@@ -1,19 +1,9 @@
 RoboDojo
 ========
 
-Control bimanual tabletop scenes through RPent tools in RoboDojo. The simulator
-uses Isaac Sim / IsaacLab with an ARX-X5 dual-arm platform.
-
-.. note::
-
-   Scripted tools use native cuRobo pose planning and joint-target execution.
-   The planner's default obstacle model contains a simplified table, not all
-   objects or the opposite arm. Planning and path subsampling do not guarantee
-   collision-free execution. Component and bounded execution checks do not
-   establish a benchmark success rate.
-
-   ``pi0_pick``, ``stabilize``, and ``place_in_bin`` are not registered. Default
-   startup loads VPP2, not Pi0.5. Flash replay remains unavailable.
+Run bimanual tabletop tasks with RPent in RoboDojo. The simulator uses
+Isaac Sim / IsaacLab with an ARX-X5 dual-arm platform. RPent combines VPP2
+policy actions, native motion primitives and SAM3 object segmentation.
 
 Overview
 --------
@@ -146,8 +136,8 @@ and set the resource directory:
 .. code-block:: bash
 
    hf download RoboDojo-Benchmark/RoboDojo --repo-type dataset \
-     --include 'Assets/**' --local-dir /data/robodojo
-   export ROBODOJO_ASSETS_ROOT=/data/robodojo
+     --include 'Assets/**' --local-dir /path/to/robodojo
+   export ROBODOJO_ASSETS_ROOT=/path/to/robodojo
 
 The download should contain ``Assets/Robots``, ``Assets/Object``,
 ``Assets/Material``, and ``Assets/Eval_Layout``.
@@ -181,22 +171,30 @@ For offline use or repeated resource-loading failures, see
 VLA Configuration
 -----------------
 
-Normal CLI startup loads Env, SAM3 and VPP2. ``--vla-backend vpp2`` selects
-the policy backend; ``vpp2`` is the default and the only supported value.
-Prepare a VPP2 resource root
-before starting a task, or connect an existing service with
-``--vla-endpoint socket://host:port``. Missing resources are an error, not a
-fallback to Pi0.5 or analytic-only execution. Component-only developer runs
-may select Env without a model.
+VPP2 is the default action model, selected with ``--vla-backend vpp2``.
+Prepare the official
+`VPP2 RoboDojo implementation <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_
+and the paired 100k weights from
+`Haodong082399/VPP2 <https://huggingface.co/Haodong082399/VPP2>`_.
+Choose a resource directory and set its location, as in the following example.
+Replace ``/path/to/vpp2`` with your own directory:
 
-The adapter targets the official
-`VPP2 RoboDojo implementation <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_.
-Keep its source checkout under ``policy/`` and the official downloaded weight
-layout under ``checkpoints/``. Symlinks to existing resources are supported:
+.. code-block:: bash
+
+   export VPP2_MODEL_PATH=/path/to/vpp2
+   git clone --no-checkout https://github.com/roboterax/video-prediction-policy-2.git \
+     "$VPP2_MODEL_PATH/policy"
+   git -C "$VPP2_MODEL_PATH/policy" checkout 72c17acf022494ff63617be86079bb92e92f5bf8
+   hf download Haodong082399/VPP2 --local-dir "$VPP2_MODEL_PATH" \
+     --include 'checkpoints/joint2b_s100000/**' \
+     --include 'checkpoints/Wan2.1-I2V-14B-480P/**'
+
+The resource root has the following layout. Subdirectories may be symbolic
+links to existing resources:
 
 .. code-block:: text
 
-   /data/vpp2/
+   vpp2/
    ├── policy/src/vpp2/policy.py
    └── checkpoints/
        ├── joint2b_s100000/
@@ -205,57 +203,26 @@ layout under ``checkpoints/``. Symlinks to existing resources are supported:
        │   └── dataset_stats.json
        └── Wan2.1-I2V-14B-480P/
 
-Download the complete paired 100k bundle, including support files, and shared
-encoders from `Haodong082399/VPP2 <https://huggingface.co/Haodong082399/VPP2>`_.
-Follow the pinned project's `inference environment instructions
+Install the model dependencies using the pinned project's
+`inference environment instructions
 <https://github.com/roboterax/video-prediction-policy-2/blob/72c17acf022494ff63617be86079bb92e92f5bf8/docs/robodojo.md#policy-environment>`_.
-The simulator extra does not install VPP2's model dependencies. Do not overwrite
-the simulator's pinned Torch stack to match the policy environment; a separate
-model environment can install RPent's core package and serve VPP2:
+These dependencies are separate from ``.[robodojo-sim]``. When they are
+compatible with the RPent environment, ``VPP2_MODEL_PATH`` enables automatic
+local startup; ``--vla-model-path`` overrides it. The local server loads the
+full model on one GPU using RPent's current Python interpreter.
+
+To use a separate model environment, install the policy dependencies and RPent's
+core package there, then start the service:
 
 .. code-block:: bash
 
-   # In the prepared model environment, with RPent installed:
-   python -m robots.robodojo.vpp2_server --model-path /data/vpp2 \
+   python -m robots.robodojo.vpp2_server --model-path /path/to/vpp2 \
      --host 127.0.0.1 --port 9201
 
-   # In the RPent/simulator environment, add this to the task command:
-   # --vla-endpoint socket://127.0.0.1:9201
-
-If model dependencies are compatible with the current interpreter, set
-``VPP2_MODEL_PATH=/data/vpp2`` or ``--vla-model-path /data/vpp2`` for automatic
-local startup. Local VPP2 uses the current interpreter; ``--sim-python``
-selects only the simulator interpreter. Borrowed endpoints are not stopped
-by RPent.
-
-The agent supplies a required subtask through
-``vpp2_act(instruction, chunks=1)``; the environment's original instruction
-and success criterion remain unchanged. Each inference predicts 32 absolute
-dual-arm EE16 targets (xyz, wxyz and gripper per arm), executes the first 24
-through native EE control, then replans for another requested chunk.
-This does not call the analytic ``move_to`` planner for each target.
-
-The environment client retains an initial RGB anchor and at most 177 recent
-three-camera observations. Every executed native action updates the history,
-including analytic actions; image reads and ``render`` do not advance it.
-Requests contain the anchor plus eight samples ending at the current action,
-spaced by 25 actions; early missing times use the anchor. At 640×480 per camera,
-the raw uint8 cache is about 469 MiB per episode, not an unbounded video archive.
-Depth and full observations are not retained in this cache.
-
-The server uses official composition, history quantization and normalization.
-Inference seeds advance within an episode; switching subtasks does not reset
-them or the history. Actual reset clears both. Uncertain execution or missing
-action feedback invalidates policy history until reset; a read refresh cannot
-repair missing frames. Formal evaluation does not expose reset.
-
-The public checkpoint accepting a subtask string does not establish its
-subtask success rate. The default server loads the full model on one GPU;
-it does not distribute weights across multiple GPUs. A separate endpoint
-can serve a deployment with different memory requirements. No benchmark
-improvement is claimed. Legacy
-Pi0.5 diagnostics remain in source, but their flags do not select the default
-VLA or register old action tools.
+Add ``--vla-endpoint socket://127.0.0.1:9201`` to the task command in the
+RPent/simulator environment. RPent starts and stops its own model process;
+independently started services remain under their operator's control.
+For remote deployment, see :doc:`../guides/advanced_deployment`.
 
 SAM3 Configuration
 ------------------
@@ -266,8 +233,8 @@ download ``sam3.pt`` and set its path:
 
 .. code-block:: bash
 
-   hf download facebook/sam3 sam3.pt --local-dir /data/sam3
-   export SAM3_CHECKPOINT_PATH=/data/sam3/sam3.pt
+   hf download facebook/sam3 sam3.pt --local-dir /path/to/sam3
+   export SAM3_CHECKPOINT_PATH=/path/to/sam3/sam3.pt
 
 Alternatively, download the same file from
 `ModelScope <https://modelscope.cn/models/facebook/sam3>`_ and set
@@ -285,19 +252,18 @@ the terminal that will run the task:
    rpent-check-llm --planner codex --model <planner-model> --json
 
 Replace ``<planner-model>`` with the selected model. After configuring VPP2
-and SAM3, run the bottle-disposal task. This command can move both arms:
+and SAM3, run the bottle-disposal task at seed group 0, layout 0:
 
 .. code-block:: bash
 
-   # Workaround: RPent currently prioritizes a sibling rlinf checkout, which can shadow the installed RoboDojo integration.
-   # Point to the active environment's site-packages so child services use its installed RLinf.
-   # Remove this setting once RPent's default import-path selection is fixed.
+   # Use the RLinf integration installed in the active environment.
    export RPENT_RLINF_ROOT="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
 
    export ROBODOJO_PLACEMENT_SETTLE_STEPS=1000  # Recommended: let objects settle; the default is 20 steps
    export OMNI_KIT_ACCEPT_EULA=YES  # Recommended for the first non-interactive start; omit if the Kit license is already accepted
    # Isaac Sim takes tens of seconds to start; the first run also compiles shaders
-   rpent --robot robodojo --task put_bottles_into_dustbin --layout 0 \
+   rpent --robot robodojo --vla-backend vpp2 \
+     --task put_bottles_into_dustbin --seed 0 --layout 0 \
      --planner codex --model <planner-model> --reasoning-effort medium \
      --max-turns 40 --planner-timeout-s 1500 \
      --output-dir /path/to/run-output
@@ -319,8 +285,8 @@ run, inspect these files in the directory selected by ``--output-dir``:
 
 Check ``environment_result_available=true`` and
 ``agent_error_present=false`` first, then inspect whether ``success`` is
-``true``. A clean service exit or a planner call to ``finish`` alone does not
-establish task success.
+``true``. This field records RoboDojo's native task verdict; ``finish`` ends
+the planner loop.
 
 Without ``--output-dir``, results go to
 ``logs/<timestamp>_robodojo_<task>_s<seed>_l<layout>/``. Use different directories for
@@ -331,13 +297,16 @@ Common Options
 
 RPent starts the simulator, SAM3 and VPP2 services in the current Python environment
 by default. Specify ``--sim-python`` when the simulator uses a separate
-environment. ``--pi05-python`` does not select the VPP2 interpreter.
+environment.
 
 - ``--task``, ``--seed`` (default 0) and ``--layout`` select a fixed scene.
   The seed selects the official layout group; layout selects an index within it. ``--random``
   ignores ``--layout`` and samples a new random scene on each reset.
 - ``--cuda-device`` selects the GPU for locally started services. If omitted,
   services inherit ``CUDA_VISIBLE_DEVICES``.
+- ``--vla-backend`` selects the action model; currently ``vpp2`` is supported.
+- ``--vla-model-path`` overrides ``VPP2_MODEL_PATH`` and points to the resource
+  root containing ``policy/`` and ``checkpoints/``.
 - ``--env-endpoint``, ``--sam3-endpoint`` and ``--vla-endpoint`` connect to
   existing services. The VLA endpoint must serve this adapter's VPP2 protocol.
 - ``--source-root`` selects a local RoboDojo checkout instead of the packaged code.
@@ -350,6 +319,15 @@ Tools
 -----
 
 The planner cannot reset an episode; exploration and Flash replay are unavailable.
+
+``vpp2_act(instruction, chunks=1)`` runs the specified subtask. Each chunk
+predicts 32 absolute dual-arm EE16 targets (xyz, wxyz and gripper per arm)
+and executes the first 24 through native EE control before replanning.
+VPP2 uses the initial RGB frame and eight history samples spaced by 25 actions.
+Both policy and primitive actions update this history; switching subtasks
+preserves it. Image reads and ``render`` do not advance the action timeline.
+Missing action feedback invalidates policy history until reset; start a new
+episode to resume VPP2 when reset is unavailable.
 
 ``view_env_state`` reads saved images and state; ``render`` captures a new
 observation. ``sample_world_xyz(view, pixels, step=None, neighborhood=1)``
@@ -369,9 +347,13 @@ Describe visible colour, shape and location in ``segment(text_prompt=...)``.
 It returns a red-mask overlay; inspect it before using the point, because a
 high score does not establish object identity. If segmentation fails, revise
 the description or manually query a visible pixel in the same saved frame.
-The overlay and geometry are saved with that frame. Unlike LIBERO's interface,
-this tool does not accept point prompts or return mask-median world coordinates;
-use ``back_project`` for the selected foreground pixel.
+The overlay and geometry are saved with that frame. Use ``back_project``
+to obtain world coordinates for the selected foreground pixel.
+
+Motion primitives use native cuRobo pose planning and joint-target execution.
+The planner's obstacle model includes a simplified table; choose waypoints
+with clearance from scene objects and the other arm, which are not fully
+represented in that model.
 
 ``move_to(arm, xyz, quat=None, gripper=None, substeps=25)`` uses world metres
 and wxyz orientation. Omitted orientation and gripper targets are held.
@@ -382,11 +364,9 @@ not an arrival guarantee. Check ``completed``, ``executed_steps`` and
 ``stop_reason``; a timed-out mutation may have executed and is not retried.
 
 ``set_gripper(arm, val, steps=10)`` uses 0=closed and 1=open. ``release``
-defaults to 1. Intermediate values are continuous targets, not guaranteed
-physical widths. Feedback comes from measured joints, not the command field.
-Only a physically out-of-range measurement is saturated when selecting the
-interpolation start; invalid user inputs are rejected. Other controller
-targets are retained. Each action target undergoes native interpolation.
+defaults to 1. Intermediate values are normalized opening targets rather than
+physical widths. Feedback comes from measured joints. Other controller targets
+are retained while the gripper moves.
 
 .. _robodojo-local-nvidia-assets:
 
@@ -407,33 +387,33 @@ The steps below prepare local resources for ``Assets/Isaac/5.0`` paths.
 The three parts of the complete asset pack total about 150 GB; this is not
 the download size for a single RoboDojo scene. Allow extra space for merging
 and extraction. For an offline machine, download the parts on a connected
-machine first, then copy them to ``/data/nvidia``.
+machine first, then copy them to ``/path/to/nvidia-assets``.
 
 .. code-block:: bash
 
-   mkdir -p /data/nvidia
+   mkdir -p /path/to/nvidia-assets
 
    # Download all three parts; interrupted downloads can resume
-   wget -c -P /data/nvidia \
+   wget -c -P /path/to/nvidia-assets \
      https://download.isaacsim.omniverse.nvidia.com/isaac-sim-assets-complete-5.0.0.zip.001 \
      https://download.isaacsim.omniverse.nvidia.com/isaac-sim-assets-complete-5.0.0.zip.002 \
      https://download.isaacsim.omniverse.nvidia.com/isaac-sim-assets-complete-5.0.0.zip.003
 
    # Merge and extract, preserving the Assets/Isaac/5.0 directory structure
-   cat /data/nvidia/isaac-sim-assets-complete-5.0.0.zip.001 \
-       /data/nvidia/isaac-sim-assets-complete-5.0.0.zip.002 \
-       /data/nvidia/isaac-sim-assets-complete-5.0.0.zip.003 \
-     > /data/nvidia/isaac-sim-assets-complete-5.0.0.zip
-   unzip /data/nvidia/isaac-sim-assets-complete-5.0.0.zip -d /data/nvidia
+   cat /path/to/nvidia-assets/isaac-sim-assets-complete-5.0.0.zip.001 \
+       /path/to/nvidia-assets/isaac-sim-assets-complete-5.0.0.zip.002 \
+       /path/to/nvidia-assets/isaac-sim-assets-complete-5.0.0.zip.003 \
+     > /path/to/nvidia-assets/isaac-sim-assets-complete-5.0.0.zip
+   unzip /path/to/nvidia-assets/isaac-sim-assets-complete-5.0.0.zip -d /path/to/nvidia-assets
 
-   test -d /data/nvidia/Assets/Isaac/5.0/Isaac
-   test -d /data/nvidia/Assets/Isaac/5.0/NVIDIA
+   test -d /path/to/nvidia-assets/Assets/Isaac/5.0/Isaac
+   test -d /path/to/nvidia-assets/Assets/Isaac/5.0/NVIDIA
 
 Set this variable in the terminal that will run RPent, then run the task:
 
 .. code-block:: bash
 
-   export ROBODOJO_USD_ASSET_PREFIX=/data/nvidia
+   export ROBODOJO_USD_ASSET_PREFIX=/path/to/nvidia-assets
 
 This changes the matching RoboDojo 5.0 resource URLs to local paths. It does
 not make every Isaac Sim resource available offline. If other online resources
