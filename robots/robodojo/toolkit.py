@@ -29,7 +29,9 @@ from rpent.utils.logging import get_output_dir
 OBSERVATION_TOOLS = frozenset(
     {"view_env_state", "segment", "back_project", "sample_world_xyz", "query_world_map"}
 )
-MOTION_TOOLS = frozenset({"move_to", "rotate_wrist", "set_gripper", "release"})
+MOTION_TOOLS = frozenset(
+    {"move_to", "move_delta", "hold", "rotate_wrist", "set_gripper", "release"}
+)
 
 if TYPE_CHECKING:
     from rpent.memory.manager import MemoryManager
@@ -71,6 +73,10 @@ class RoboDojoToolkit(Toolkit):
 
     def execute_tool(self, name, input_dict):
         result = super().execute_tool(name, input_dict)
+        if name == "finish" and result.data.get("_finish"):
+            end = getattr(self._primitives.env, "end_execution", None)
+            if end is not None:
+                end()
         if not self.eval_fair and name in {
             "segment",
             "back_project",
@@ -107,6 +113,9 @@ class RoboDojoToolkit(Toolkit):
         from robots.robodojo import tools as robodojo_tools
 
         self._pending_perception = []
+        observer = primitives_kwargs.get("execution_observer")
+        if observer is not None:
+            primitives_kwargs["env"].register_execution_observer(observer)
         self._state.reset()
         self._primitives = RoboDojoPrimitives(
             env=primitives_kwargs["env"],
@@ -121,7 +130,24 @@ class RoboDojoToolkit(Toolkit):
 
     def close(self) -> None:
         """Drain tools; the runtime owns the environment across planner sessions."""
-        super().close()
+        try:
+            super().close()
+        finally:
+            end = getattr(self._primitives.env, "end_execution", None)
+            if end is not None:
+                end()
+
+    def cancel_active_and_wait(self) -> None:
+        super().cancel_active_and_wait()
+        pause = getattr(self._primitives.env, "pause_execution", None)
+        if pause is not None:
+            pause()
+
+    def resume_calls(self) -> None:
+        resume = getattr(self._primitives.env, "resume_execution", None)
+        if resume is not None:
+            resume()
+        super().resume_calls()
 
     def solved(self) -> bool:
         """Read official success for the runner after planner execution."""

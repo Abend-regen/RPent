@@ -248,7 +248,11 @@ def make_native():
         planner={arm: SimpleNamespace(plan_path=plan) for arm in ("left", "right")},
     )
     return SimpleNamespace(
-        robot_manager=manager, take_action_cnt=[0], step_lim=10, end_flag=[False]
+        robot_manager=manager,
+        take_action_cnt=[0],
+        step_lim=10,
+        end_flag=[False],
+        sim=SimpleNamespace(sim=SimpleNamespace(current_time=0.0)),
     ), plans
 
 
@@ -271,7 +275,7 @@ def test_native_waypoint_holds_all_other_targets(make_agent, arm):
     }
     captured = []
 
-    def step(action):
+    def step(action, *, expected_step=None):
         captured.append(deepcopy(action))
         env.take_action_cnt[0] += 1
         return (
@@ -282,6 +286,7 @@ def test_native_waypoint_holds_all_other_targets(make_agent, arm):
         )
 
     agent.step_native = step
+    agent._observation = lambda: {"feedback": "post-action"}
     before = agent.get_motion_state()["targets"]
     result = agent.step_joint_update(arm, gripper=0.25)
     expected = deepcopy(before)
@@ -454,3 +459,72 @@ def test_scene_identity_in_config(tmp_path):
     assert config.task_desc["seed"] == 2 and config.task_desc["layout"] == 3
     assert config.recipe_tag.endswith("s2_l3")
     assert robot_spec.get_robot_spec().supports_exploration is False
+
+
+@pytest.mark.parametrize("frame", ["world", "tool"])
+@pytest.mark.parametrize("angle", [37.0, -29.0])
+@pytest.mark.parametrize("sign", [1, -1])
+def test_move_delta_arbitrary_axis_and_nonidentity_pose(motion, frame, angle, sign):
+    from scipy.spatial.transform import Rotation
+
+    env, primitive = motion
+    initial = Rotation.from_euler("xyz", [23, -14, 71], degrees=True)
+    env.pose[3:] = (sign * initial.as_quat(scalar_first=True)).tolist()
+    axis = np.array([2.0, -3.0, 4.0])
+    delta = np.array([0.01, -0.02, 0.03])
+    rotation = Rotation.from_rotvec(axis / np.linalg.norm(axis) * np.deg2rad(angle))
+    result = primitive.move_delta(
+        arm="right",
+        dxyz=delta.tolist(),
+        axis=axis.tolist(),
+        angle_deg=angle,
+        frame=frame,
+        substeps=1,
+    ).data
+    target = env.plans[-1][1]
+    expected_rotation = rotation * initial if frame == "world" else initial * rotation
+    expected_delta = delta if frame == "world" else initial.apply(delta)
+    np.testing.assert_allclose(
+        target[:3], np.array(env.pose[:3]) + expected_delta, atol=1e-12
+    )
+    actual = Rotation.from_quat(target[3:], scalar_first=True)
+    assert (actual.inv() * expected_rotation).magnitude() < 1e-12
+    assert result["executed_actions"] == 1
+
+
+def test_move_delta_noop_and_explicit_gripper_target(motion):
+    env, primitive = motion
+    result = primitive.move_delta(arm="left").data
+    assert result["executed_actions"] == 0 and result["stop_reason"] == "no_op"
+    assert result["step_before"] == result["step_after"] == 0
+    assert not env.plans and not env.updates
+    primitive.move_delta(arm="left", gripper=0.5, substeps=1)
+    assert len(env.updates) == 1 and env.opening["left"] == 0.5
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"axis": [0, 0, 0], "angle_deg": 1},
+        {"angle_deg": np.nan},
+        {"dxyz": [0, np.inf, 0]},
+        {"frame": "camera"},
+        {"substeps": -1},
+        {"substeps": True},
+        {"axis": [1, 2]},
+        {"gripper": -0.1},
+    ],
+)
+def test_invalid_delta_never_plans_or_moves(motion, kwargs):
+    env, primitive = motion
+    with pytest.raises(ValueError):
+        primitive.move_delta(arm="left", **kwargs)
+    assert not env.plans and not env.updates
+
+
+@pytest.mark.parametrize("steps", [0, -1, 1.5, True])
+def test_invalid_hold_never_moves(motion, steps):
+    env, primitive = motion
+    with pytest.raises(ValueError):
+        primitive.hold(steps=steps)
+    assert not env.updates

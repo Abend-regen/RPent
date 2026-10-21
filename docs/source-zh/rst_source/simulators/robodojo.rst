@@ -73,7 +73,7 @@ RoboDojo
    * - 观测
      - 头部和左右腕部相机的 RGB-D 图像、相机标定，以及双臂关节状态、末端执行器位姿和夹爪开合状态。
    * - 动作
-     - ``move_to``、``rotate_wrist``、``set_gripper`` 和 ``release``。``finish`` 不能覆盖原生任务判定。
+     - ``move_to``、``move_delta``、``hold``、``rotate_wrist``、``set_gripper`` 和 ``release``。``finish`` 不能覆盖原生任务判定。
    * - 奖励与成功判定
      - 任务是否成功由 RoboDojo 原生环境判定，结果记录在 ``result.json`` 的 ``success`` 字段中。
    * - 任务指令
@@ -245,6 +245,33 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 ``move_to(arm, xyz, quat=None, gripper=None, substeps=25)`` 使用世界坐标、米及 wxyz 四元数；省略姿态或夹爪参数则保持对应状态／目标。``substeps`` 限制路径抽样数，0 保留完整路径，1 仅取最后路点，不代表速度或物理步数。``rotate_wrist`` 绕世界 Z 轴相对旋转，单位为度。``final_dist_m`` 是实测位置误差，不是到达保证。检查 ``completed``、``executed_steps`` 和 ``stop_reason``；超时的动作可能已在服务端执行，不会自动重试。
 
 ``set_gripper(arm, val, steps=10)`` 使用 0=闭、1=开，``release`` 默认开到 1。中间值是连续控制目标，不保证对应精确物理宽度；反馈读取实际关节，而非命令字段。仅当实测值因物理超调越界时，将插值起点限制在合法范围，用户非法输入仍被拒绝。其他关节目标保持不变，每次下发目标还会经过底层插值。
+
+相对运动与保持
+~~~~~~~~~~~~~~
+
+``move_delta(arm, dxyz=[0,0,0], axis=[0,0,1], angle_deg=0, frame="world", gripper=None, substeps=25)`` 从调用时实测的末端位姿构造目标，复用 ``move_to`` 的原生规划器。平移单位为米，旋转单位为度，任意非零旋转轴穿过末端原点。``world`` 使用世界坐标平移并左乘旋转；``tool`` 使用起始工具坐标系并右乘旋转。平移不会使末端绕世界原点公转，等价四元数 ``q`` 和 ``-q`` 产生相同的目标位姿。这不承诺直线、固定旋转轴轨迹或多圈旋转。零平移、零角度且未指定夹爪目标时返回零动作的 ``no_op``；显式指定夹爪目标仍属于动作请求。
+
+``hold(steps)`` 要求正整数，按原生动作次数重复双臂及夹爪当前保持的控制目标，受回合剩余预算和取消约束。仿真时间会推进，实际位姿和物体不一定静止。一个动作可能包含多个物理子步；``steps`` 和反馈计数均不代表物理子步、观测采样周期或墙钟时间。``substeps`` 只控制路径采样数量，运动 primitive 不另外提供 ``max_steps`` 预算。
+
+执行结果包含 ``step_before``、``step_after``、``executed_actions``、``terminated`` 和 ``truncated``。原有 ``executed_steps`` 同样表示原生动作数量。中断或结果不确定时只报告已确认的进度，不重试动作。``get_motion_state()`` 中的 ``simulation_time_s`` 是独立于动作计数的仿真时间。
+
+有状态适配器协作
+~~~~~~~~~~~~~~~~
+
+默认 Env + SAM3 工具链不需要 VLA。后续模型适配器可通过 ``env.register_execution_observer(callback)`` 注册一个同步回调，或通过 toolkit 的运行时 kwargs 传入 ``execution_observer``。注册时发送包含当前观测和状态的 ``attached`` 通知，不重置环境或模型。协作期间只能由一个 RPent 客户端持有环境控制权；其他客户端不得重置或修改同一服务。
+
+适配器每次推理前必须调用 ``env.require_policy_ready()``，并通过 ``env.step_policy(action)`` 执行自身动作。指令切换、剩余动作缓存、推理串行化及模型历史采样由适配器负责。此边界不提供 Policy 调度器、动作缓存或模型历史采样器。RoboDojo 客户端和服务端均明确禁止 ``chunk_step``；支持的动作入口逐个动作获取确认。
+
+回调接收以下事件：
+
+* ``actions_invalidated``：在外部动作、primitive 或 hold 接管前，以及取消、终止、关闭或失同步时发送。丢弃缓存的 Policy 动作，不自动重置模型历史。
+* ``action_feedback``：每个确认动作的权威 ``step_before``、``step_after``、``executed_actions``、对应的 ``observation``、``episode_status``、``terminated``、``truncated`` 和 ``source``。只为实际执行的动作追加历史；零动作拒绝及只读查询不重复追加帧。回调应在接受事件后返回，不得重入推理或环境修改操作。
+* ``episode_end`` 与 ``reset`` 分开通知。只有显式环境重置成功后才发送 ``reset``，并附带初始观测。
+* ``synchronization_lost``：RPC 结果不确定、计数不一致、观测缺失或反馈交付失败时发送。保留已确认的动作进度，同时阻止继续进入推理或执行。
+
+Policy 预算暂停只需停止调用方的循环，不调用 ``pause_execution()``；同回合、同指令且环境未额外推进时可保留剩余动作。``pause_execution()`` 表示取消，会使动作缓存失效；``resume_execution()`` 只解除暂停，不能修复失同步。执行前的参数拒绝或规划失败不会使模型历史失去可信状态。环境指令变化或检测到边界外动作计数变化时，协作边界会停止接纳推理及执行。
+
+当前显式恢复方式是成功调用 ``env.reset()``，并成功交付重置事件，不会自动恢复。如果取消同时暂停了控制，还需显式恢复暂停。Eval-fair 服务禁止 reset，需开启新回合／服务。关闭 toolkit 会结束本次协作边界，后续会话须建立新的客户端／适配器。丢失响应后不重试动作。离线假适配器与仿真 primitive 检查只验证公共契约，不代表真实 Awomo 或 VPP2 已兼容；真实模型整合和完整 episode 对照另行验收。
 
 .. _robodojo-local-nvidia-assets:
 

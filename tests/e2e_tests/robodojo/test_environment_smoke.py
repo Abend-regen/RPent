@@ -42,9 +42,21 @@ def test_environment_primitives(monkeypatch):
     output = Path(os.environ["RPENT_E2E_OUTPUT_DIR"])
     monkeypatch.setattr(logging, "_output_dir", output)
     spec = get_robot_spec()
-    args = parse_runtime_args(
-        spec, ["--task", "put_bottles_into_dustbin", "--seed", "0", "--layout", "0"]
-    )
+    flags = [
+        "--task",
+        os.environ.get("RPENT_ROBODOJO_TASK", "put_bottles_into_dustbin"),
+        "--seed",
+        "0",
+        "--layout",
+        os.environ.get("RPENT_ROBODOJO_LAYOUT", "0"),
+    ]
+    for variable, flag in (
+        ("RPENT_ROBODOJO_SIM_PYTHON", "--sim-python"),
+        ("RPENT_ROBODOJO_SOURCE_ROOT", "--source-root"),
+    ):
+        if os.environ.get(variable):
+            flags.extend([flag, os.environ[variable]])
+    args = parse_runtime_args(spec, flags)
     with runtime_phase(spec, args, output / "runtime", {"env"}) as kwargs:
         env = kwargs["env"]
         toolkit = RoboDojoToolkit(
@@ -110,6 +122,67 @@ def test_environment_primitives(monkeypatch):
                 check_pose_transition(
                     moved, env.get_motion_state()[f"{arm}_eef_pose"], yaw_deg=3
                 )
+            # Hold advances actual simulator time without replacing held targets
+            # with measurements; check both without and with an attached observer.
+            events = []
+            for attached in (False, True):
+                if attached:
+                    env.register_execution_observer(events.append)
+                before = env.get_motion_state()
+                count = env.get_status()["step"]
+                result = toolkit.execute_tool("hold", {"steps": 3})
+                assert not result.is_error, result.data
+                receipt = result.data["log"]["result"]
+                after = env.get_motion_state()
+                assert receipt["executed_actions"] == 3 and receipt["completed"]
+                assert receipt["step_before"] == count
+                assert receipt["step_after"] == env.get_status()["step"] == count + 3
+                assert after["simulation_time_s"] > before["simulation_time_s"]
+                for key in before["targets"]:
+                    np.testing.assert_array_equal(
+                        before["targets"][key], after["targets"][key]
+                    )
+            for arm in ("left", "right"):
+                before = env.get_motion_state()
+                count = env.get_status()["step"]
+                result = toolkit.execute_tool(
+                    "move_delta",
+                    {
+                        "arm": arm,
+                        "dxyz": [0, 0, 0.005],
+                        "axis": [1, 2, 3],
+                        "angle_deg": -2.0,
+                        "frame": "world",
+                        "substeps": 25,
+                    },
+                )
+                assert not result.is_error, result.data
+                receipt = result.data["log"]["result"]
+                assert receipt["completed"] and receipt["executed_actions"] > 0, receipt
+                assert env.get_status()["step"] - count == receipt["executed_actions"]
+                after = env.get_motion_state()
+                other = "right" if arm == "left" else "left"
+                for suffix in ("arm_joint_state", "ee_joint_state"):
+                    key = f"{other}_{suffix}"
+                    np.testing.assert_array_equal(
+                        before["targets"][key], after["targets"][key]
+                    )
+                key = f"{arm}_ee_joint_state"
+                np.testing.assert_array_equal(
+                    before["targets"][key], after["targets"][key]
+                )
+                assert not np.array_equal(
+                    before["targets"][f"{arm}_arm_joint_state"],
+                    after["targets"][f"{arm}_arm_joint_state"],
+                )
+            receipts = [event for event in events if event["kind"] == "action_feedback"]
+            assert len(receipts) == env.get_status()["step"] - events[0]["step"]
+            assert len({event["step_after"] for event in receipts}) == len(receipts)
+            assert all(
+                event["executed_actions"] == 1 and event["observation"]["vision"]
+                for event in receipts
+            )
+            assert not any(event["kind"] == "reset" for event in events)
             env.reset()
             assert toolkit._state.get(record.step_idx).step_idx == record.step_idx
             final = env.get_motion_state()

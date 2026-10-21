@@ -457,6 +457,8 @@ def test_toolkit_exposes_new_primitives_without_legacy_actions(
         "query_world_map",
         "move_to",
         "rotate_wrist",
+        "move_delta",
+        "hold",
         "set_gripper",
         "release",
     }

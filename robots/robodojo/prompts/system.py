@@ -47,6 +47,12 @@ back_project when you need a visible surface's world position."""
 TOOLS = """move_to(arm, xyz, quat=None, gripper=None, substeps=25) plans a full
 pose. Quaternion order is wxyz; omitted orientation and opening are held.
 rotate_wrist applies relative yaw about world Z, in degrees.
+move_delta plans a relative end-effector target with translation in metres and
+arbitrary-axis rotation in degrees, in the world or initial tool frame. substeps
+samples the path; it does not bound elapsed time or native actions. Zero motion
+without a gripper target executes no action. hold advances the requested native
+action count while retaining both arms' controller targets; objects may move.
+Motion tools obey the remaining episode budget and cancellation.
 set_gripper(arm, val, steps=10) uses 0=closed, 1=open; release defaults to 1.
 Intermediate openings are control targets, not guaranteed physical widths.
 substeps samples the planned path, not time or physical simulation steps;

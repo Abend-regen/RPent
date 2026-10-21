@@ -83,7 +83,7 @@ Observation and Action
    * - Observation
      - Head and left/right wrist RGB-D images, camera calibration, and joint states, end-effector poses, and gripper states for both arms.
    * - Action
-     - ``move_to``, ``rotate_wrist``, ``set_gripper``, and ``release``. ``finish`` cannot override the native task verdict.
+     - ``move_to``, ``move_delta``, ``hold``, ``rotate_wrist``, ``set_gripper``, and ``release``. ``finish`` cannot override the native task verdict.
    * - Reward / success
      - RoboDojo's native environment determines task success, recorded in the ``success`` field of ``result.json``.
    * - Task prompt
@@ -308,6 +308,86 @@ physical widths. Feedback comes from measured joints, not the command field.
 Only a physically out-of-range measurement is saturated when selecting the
 interpolation start; invalid user inputs are rejected. Other controller
 targets are retained. Each action target undergoes native interpolation.
+
+Relative motion and hold
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+``move_delta(arm, dxyz=[0,0,0], axis=[0,0,1], angle_deg=0, frame="world",
+gripper=None, substeps=25)`` constructs a target from the measured starting
+end-effector pose and uses the same native planner as ``move_to``. Translation
+is in metres; rotation is in degrees about an arbitrary nonzero axis through
+the end-effector origin. ``world`` uses world-frame translation and left-multiplies
+the orientation; ``tool`` uses the initial tool frame and right-multiplies it.
+Translation does not orbit the end effector around the world origin. The
+resulting target is invariant under equivalent quaternions ``q`` and ``-q``.
+This does not prescribe a straight-line, fixed-axis, or multi-turn trajectory.
+Zero translation and zero angle with no gripper target return a zero-action
+``no_op``. An explicit gripper target is still an action request.
+
+``hold(steps)`` requires a positive integer. It repeats both arms' and grippers'
+held controller targets for that many native actions, subject to the remaining
+episode budget and cancellation. Simulation time advances; actual poses and
+objects need not remain stationary. Each action can contain several physics
+substeps. Neither ``steps`` nor the feedback counters represent physics steps,
+observation sampling periods, or wall-clock time. ``substeps`` only controls
+path sampling; there is no separate ``max_steps`` budget for motion primitives.
+
+Execution results include ``step_before``, ``step_after``, ``executed_actions``,
+``terminated``, and ``truncated``. Existing ``executed_steps`` is an alias for
+native actions. An interrupted or uncertain operation reports only confirmed
+progress; it never retries an action. ``simulation_time_s`` in
+``get_motion_state()`` is simulator time, independently of these counters.
+
+Stateful adapter cooperation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The default Env + SAM3 toolchain needs no VLA. A future adapter can register one
+synchronous callback with ``env.register_execution_observer(callback)`` or pass
+``execution_observer`` in toolkit runtime kwargs. Registration emits ``attached``
+with the current observation and status; it does not reset the environment or
+model. Only one RPent client may own environment control during cooperation;
+other clients must not reset or mutate the same service.
+
+The adapter must call ``env.require_policy_ready()`` before each inference and
+execute its own actions with ``env.step_policy(action)``. The adapter owns
+instruction changes, action remainder, inference serialization, and model
+history sampling. This boundary provides no Policy scheduler, action cache, or
+model-history sampler. RoboDojo ``chunk_step`` is explicitly unsupported on both
+client and server; supported mutation paths use one acknowledged action at a time.
+
+The callback receives these events:
+
+* ``actions_invalidated`` before external, primitive, or hold takeover, on
+  cancellation, termination, closure, or synchronization loss. Discard cached
+  Policy actions, without automatically resetting model history.
+* ``action_feedback`` after each acknowledged action, with authoritative
+  ``step_before``, ``step_after``, ``executed_actions``, the corresponding
+  ``observation``, ``episode_status``, ``terminated``, ``truncated``, and ``source``.
+  Append history only for executed actions; zero-action rejections and read-only
+  queries do not contribute another frame. Callbacks must return after accepting
+  the event and must not re-enter inference or environment mutations.
+* ``episode_end`` separately from ``reset``. Reset is emitted only after an
+  explicitly requested environment reset and includes its initial observation.
+* ``synchronization_lost`` when RPC results are ambiguous, counts disagree,
+  observations are missing, or feedback delivery fails. Confirmed action progress
+  is retained, but further inference admission and execution are blocked.
+
+A Policy budget pause consists of stopping the caller's loop; it does not invoke
+``pause_execution()`` and can retain the remainder if the episode, instruction,
+and environment are unchanged. ``pause_execution()`` represents cancellation
+and invalidates actions; ``resume_execution()`` only reopens that pause, never
+repairs lost synchronization. Planning or parameter rejection before execution
+does not mark model history untrusted. An environment instruction change or an
+out-of-band counter change closes the synchronization boundary.
+
+Explicit recovery currently means a successful ``env.reset()`` with successful
+reset-event delivery; it is never automatic. If cancellation also paused control,
+resume it explicitly. Eval-fair services forbid reset, so recovery requires a new
+episode/service. Closing a toolkit ends its cooperation boundary; a subsequent
+session must create a new client/adapter. No action is retried after a missing
+reply. Offline fake-adapter checks and simulator primitive checks validate this
+public contract, not compatibility with real Awomo or VPP2 models. Real model
+integration and complete-episode comparisons are separate acceptance work.
 
 .. _robodojo-local-nvidia-assets:
 
