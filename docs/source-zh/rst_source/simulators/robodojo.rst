@@ -52,10 +52,6 @@ RoboDojo
      - 8
      - 开放式或依赖语言、图像指令的任务。
 
-目录还单列了一个 DLC 任务。通过 ``--task`` 选择已安装运行时中的任务，``--layout`` 选择场景布局。\
-例如，``stack_bowls_random`` 属于泛化任务，``fill_pen_holder`` 和 ``put_bottles_into_dustbin``\
-属于长程任务。这三个名称只是示例，并非完整任务列表。
-
 观测与动作
 ~~~~~~~~~~
 
@@ -254,8 +250,8 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 
 默认由 RPent 在当前 Python 环境中启动仿真、SAM3 和 VPP2 服务。仿真器安装在独立环境时，指定 ``--sim-python``。
 
-- ``--task``、``--seed``（默认 0）和 ``--layout``：选择任务、官方布局组和组内布局编号；传入 ``--random`` 时忽略 ``--layout``，\
-  每次重置重新采样随机场景。
+使用 ``--task`` 选择任务。固定场景通过 ``--seed`` 选择官方布局组，通过 ``--layout`` 选择组内布局，两者默认均为 ``0``。例如，``--task stack_blocks --seed 0 --layout 2`` 使用第 0 组的第 2 个布局。需要随机生成场景时，添加 ``--random``，此时 ``--layout`` 不生效。
+
 - ``--cuda-device``：为本地启动的服务选择 GPU；省略时沿用 ``CUDA_VISIBLE_DEVICES``。
 - ``--vla-backend``：选择动作模型，目前支持 ``vpp2``。
 - ``--vla-model-path``：覆盖 ``VPP2_MODEL_PATH``，指向包含 ``policy/`` 和 ``checkpoints/`` 的资源根目录。

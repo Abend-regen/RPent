@@ -55,12 +55,6 @@ groups 42 benchmark tasks into five capability categories:
      - 8
      - Open-ended or language- and image-conditioned tasks.
 
-The catalog also lists one separate DLC task. Use ``--task`` to select a task
-from the installed runtime and ``--layout`` to select its scene layout. For
-example, ``stack_bowls_random`` is a generalization task, while
-``fill_pen_holder`` and ``put_bottles_into_dustbin`` are long-horizon tasks.
-These are examples, not the complete task list.
-
 Observation and Action
 ~~~~~~~~~~~~~~~~~~~~~~
 
@@ -299,9 +293,13 @@ RPent starts the simulator, SAM3 and VPP2 services in the current Python environ
 by default. Specify ``--sim-python`` when the simulator uses a separate
 environment.
 
-- ``--task``, ``--seed`` (default 0) and ``--layout`` select a fixed scene.
-  The seed selects the official layout group; layout selects an index within it. ``--random``
-  ignores ``--layout`` and samples a new random scene on each reset.
+Use ``--task`` to select a task. For a fixed scene, ``--seed`` selects an
+official layout group and ``--layout`` selects a layout within that group;
+both default to ``0``. For example,
+``--task stack_blocks --seed 0 --layout 2`` uses layout 2 from group 0.
+Add ``--random`` to generate a random scene instead; ``--layout`` has no effect
+in this mode.
+
 - ``--cuda-device`` selects the GPU for locally started services. If omitted,
   services inherit ``CUDA_VISIBLE_DEVICES``.
 - ``--vla-backend`` selects the action model; currently ``vpp2`` is supported.
