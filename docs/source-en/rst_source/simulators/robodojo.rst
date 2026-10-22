@@ -66,7 +66,7 @@ Observation and Action
    * - Observation
      - Head and left/right wrist RGB-D images, camera calibration, and joint states, end-effector poses, and gripper states for both arms.
    * - Action
-     - ``move_to``, ``rotate_wrist``, ``set_gripper``, ``release``, and ``vpp2_act``. ``finish`` cannot override the native task verdict.
+     - ``move_to``, ``move_delta``, ``rotate_wrist``, ``set_gripper``, ``release``, ``hold``, and ``vpp2_act``. ``finish`` cannot override the native task verdict.
    * - Reward / success
      - RoboDojo's native environment determines task success, recorded in the ``success`` field of ``result.json``.
    * - Task prompt
@@ -316,7 +316,11 @@ for the full option list.
 Tools
 -----
 
-The planner cannot reset an episode; exploration and Flash replay are unavailable.
+Use ``move_to`` for an absolute pose, ``move_delta`` for a relative pose, and
+``hold`` to advance actions with unchanged controller targets. ``rotate_wrist``,
+``set_gripper`` and ``release`` control orientation and gripper opening;
+``vpp2_act`` executes a language-guided subtask. The planner cannot reset an
+episode; exploration and Flash replay are unavailable.
 
 ``vpp2_act(instruction, chunks=1)`` runs the specified subtask. Each chunk
 predicts 32 absolute dual-arm EE16 targets (xyz, wxyz and gripper per arm)
@@ -366,26 +370,50 @@ defaults to 1. Intermediate values are normalized opening targets rather than
 physical widths. Feedback comes from measured joints. Other controller targets
 are retained while the gripper moves.
 
-Relative motion and execution feedback
+Relative Motion and Execution Feedback
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``move_delta(arm, dxyz, axis=[0,0,1], angle_deg=0, frame="world", substeps=25)``
-plans a relative end-effector target. Translation is in metres and rotation
-in degrees about an axis through the end effector. ``frame="tool"`` uses the
-initial tool frame for both. This specifies a target, not a straight-line or
-multi-turn trajectory. Zero displacement without a gripper target is a no-op.
+``move_delta`` plans a relative end-effector target for ``arm``. ``dxyz`` is
+translation in metres; ``angle_deg`` is rotation in degrees about ``axis``
+(default ``[0, 0, 1]``), which passes through the initial end-effector origin.
+The default ``frame="world"`` expresses both translation and axis direction
+in world coordinates; ``frame="tool"`` uses the initial tool coordinates.
+A nonzero angle requires a nonzero axis. ``substeps=25`` samples the planned
+path as for ``move_to``; it does not specify physics steps. The target does
+not guarantee a straight-line or multi-turn trajectory. When translation and
+angle are both zero and ``gripper`` is omitted, the tool returns without
+executing an action.
 
-``hold(steps)`` advances native actions while retaining both arms' and grippers'
-controller targets; the simulation and objects continue moving. Both tools use
-the existing action trace and VPP2 history path. Every confirmed action adds one
-history frame; observation reads do not. Results report requested/executed action
-counts, native step counters, termination and truncation.
+``hold(steps)`` requests a positive number of native actions while retaining
+both arms' and grippers' controller targets. Simulation and object motion
+continue; episode termination, the action budget or cancellation can stop it
+early. Both tools record their results through the usual action history.
+Each confirmed action contributes one observation to VPP2 history, including
+hold actions; reading observations does not advance it.
 
-A synchronous execution observer can consume acknowledged observations. Primitive
-control invalidates pending policy actions before takeover. Cancellation pauses
-execution; resume does not repair uncertain feedback. A successful environment
-reset clears the pause and restores synchronization and VPP2 history. A lost
-reply or failed observer delivery requires reset before policy inference.
+Execution receipts describe the whole tool call. For ``vpp2_act``, this includes
+all requested chunks:
+
+- ``step_before`` is the native step at the start of the call. ``step_after``
+  and ``episode_status`` retain the last confirmed execution state.
+- ``requested_actions`` and ``executed_actions`` report the requested and
+  confirmed action counts; ``requested_steps`` and ``executed_steps`` report
+  the same counts. Two complete VPP2 chunks starting at step 1 therefore report
+  ``step_before=1``, ``step_after=49`` and ``executed_actions=48``.
+- ``completed`` describes command execution, not task success. Inspect
+  ``stop_reason``, ``terminated`` and ``truncated`` for early termination.
+  A later inference failure or cancellation preserves earlier confirmed actions.
+- ``execution_uncertain=true`` means an action may have run without a confirmed
+  receipt. That action is excluded from ``executed_actions``; ``step_after``
+  does not establish the current remote step. Do not retry the action blindly.
+
+When primitives take control, discard pending policy actions and replan from
+fresh observations before continuing the policy. Cancellation pauses further
+execution; resuming does not repair missing or unsynchronized feedback.
+After a lost reply or synchronization failure, reset the environment before
+policy inference. A successful reset clears the execution pause and
+reinitializes VPP2 history. Since the planner has no reset tool, start a new
+episode if the session cannot reset the environment.
 
 .. _robodojo-local-nvidia-assets:
 
