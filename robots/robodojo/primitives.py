@@ -188,6 +188,7 @@ class RoboDojoPrimitives:
         if self.vla_client is None:
             raise RuntimeError("VPP2 is not connected")
         result = self._execute([])
+        step_before = result["step_before"]
         executed = completed_chunks = 0
         for _ in range(chunks):
             if result["stop_reason"] != "completed":
@@ -218,6 +219,7 @@ class RoboDojoPrimitives:
             requested_actions=chunks * REPLAN_STEPS,
             executed_steps=executed,
             executed_actions=executed,
+            step_before=step_before,
             completed=completed_chunks == chunks,
         )
         return ToolResult(data=result)
