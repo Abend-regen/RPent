@@ -147,6 +147,7 @@ def get_robot_spec() -> RobotSpec:
         init_runtime=_init_runtime,
         dashboard=ROBODOJO_DASHBOARD_SPEC,
         validate_args=_validate_args,
+        prepare_memory=_prepare_memory,
         finalize_run=finalize_run,
     )
 
@@ -200,6 +201,28 @@ def get_toolkit(
     )
 
 
+def _prepare_memory(args, config):
+    """Collaboration has no historical memory; preserve ordinary memory setup."""
+    if getattr(args, "vla_agent", False):
+        config.prompt_vars["memory_dir"] = str(config.output_dir / "agent-memory")
+        return
+    from rpent.memory.source import prepare_explicit_source
+
+    if (
+        getattr(args, "memory_profile", None)
+        or ("local" if getattr(args, "explore", False) else "hf")
+    ) == "local":
+        return
+    if getattr(args, "memory_repo", None):
+        root = prepare_explicit_source(args.memory_repo, "robodojo")
+        config.prompt_vars["memory_dir"] = str(root)
+        args.memory_dir = str(root)
+    else:
+        MemoryManager(get_memory_dir("robodojo")).sync(
+            remote_repo=get_robot_spec().memory_repo_id
+        )
+
+
 def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
     required = not use_dashboard
     parser.add_argument(
@@ -227,6 +250,30 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         "--stateful-policy",
         action="store_true",
         help="Use continuous observations with an external stateful XPolicyLab bridge",
+    )
+    parser.add_argument(
+        "--vla-agent",
+        action="store_true",
+        help="Enable stage planning and mixed control with a stateful VLA",
+    )
+    parser.add_argument(
+        "--agent-tools",
+        nargs="+",
+        choices=["policy", "motion", "geometry", "sam3"],
+        default=["policy", "motion", "geometry"],
+        help="Explicit collaboration tool groups; SAM3 is optional",
+    )
+    parser.add_argument(
+        "--agent-max-calls",
+        type=int,
+        default=120,
+        help="Collaboration tool-call limit (finish remains available)",
+    )
+    parser.add_argument(
+        "--agent-timeout-s",
+        type=int,
+        default=1800,
+        help="Collaboration wall-clock limit, also checked between native actions",
     )
     parser.add_argument(
         "--pi05-python",
@@ -300,6 +347,22 @@ def _uses_stateful_policy(args: argparse.Namespace) -> bool:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if getattr(args, "vla_agent", False):
+        if not _uses_stateful_policy(args):
+            raise ValueError("--vla-agent requires a stateful policy backend")
+        if (
+            getattr(args, "agent_max_calls", 120) < 1
+            or getattr(args, "agent_timeout_s", 1800) < 1
+        ):
+            raise ValueError("Agent budgets must be positive")
+        if (
+            getattr(args, "explore", False)
+            or getattr(args, "memory_repo", None)
+            or getattr(args, "memory_dir", None)
+        ):
+            raise ValueError("VLA Agent uses a fresh run without historical memory")
+        if getattr(args, "planner", None) == "claude_code":
+            raise ValueError("VLA Agent currently supports api and codex planners")
     if getattr(args, "planner", None) == "flash":
         raise ValueError(
             "RoboDojo legacy Flash replay is unavailable with the new motion tools"
@@ -344,7 +407,11 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
     if err:
         raise ValueError(err)
     eval_fair = getattr(args, "planner", None) == "flash"
-    summary = {} if eval_fair else robodojo_tasks.task_summary(args.task, source_root)
+    summary = (
+        {}
+        if eval_fair or getattr(args, "vla_agent", False)
+        else robodojo_tasks.task_summary(args.task, source_root)
+    )
     seed = getattr(args, "seed", 0)
     recipe_tag = f"{args.task}_s{seed}_l{args.layout}"
     if getattr(args, "random", False):
@@ -374,6 +441,10 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
             "mode": "eval-fair" if eval_fair else "dev",
             "stateful_policy": _uses_stateful_policy(args),
             "policy_backend": args.policy_backend,
+            "vla_agent": getattr(args, "vla_agent", False),
+            "agent_tools": getattr(
+                args, "agent_tools", ["policy", "motion", "geometry"]
+            ),
         },
         task_desc={
             "task": args.task,
@@ -620,6 +691,12 @@ def _init_runtime(
             else {"env", "sam3"}
         )
     )
+    if getattr(args, "vla_agent", False):
+        required = {"env", "vla"}
+        if "sam3" in args.agent_tools:
+            required.add("sam3")
+        if components is None:
+            selected = required
     unknown = selected.difference(starters)
     if unknown:
         raise ValueError(f"unknown RoboDojo runtime components: {sorted(unknown)}")
@@ -652,6 +729,12 @@ def _init_runtime(
     primitives_kwargs["task"] = args.task
     primitives_kwargs["stateful_policy"] = _uses_stateful_policy(args)
     primitives_kwargs["policy_backend"] = args.policy_backend
+    primitives_kwargs.update(
+        vla_agent=getattr(args, "vla_agent", False),
+        agent_tools=getattr(args, "agent_tools", ["policy", "motion", "geometry"]),
+        agent_max_calls=getattr(args, "agent_max_calls", 120),
+        agent_timeout_s=getattr(args, "agent_timeout_s", 1800),
+    )
     return list(owned_daemons.values()), primitives_kwargs
 
 

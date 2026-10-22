@@ -65,7 +65,24 @@ class Awomo05Client(XPolicyLabVLAClient):
             or not obs["instruction"].strip()
         ):
             raise ValueError("Awomo05 requires the official task instruction")
-        super().update_obs(obs, step)
+        # Agent geometry may include depth/calibration. Keep the learned
+        # model's inputs at the official RGB + joint-state + language boundary.
+        if (
+            set(obs) == {"instruction", "state", "vision"}
+            and set(obs["state"]) == set(STATE_FIELDS)
+            and set(obs["vision"]) == set(CAMERAS)
+            and all(set(obs["vision"][name]) == {"color"} for name in CAMERAS)
+        ):
+            payload = obs
+        else:
+            payload = {
+                "instruction": obs["instruction"],
+                "state": {key: obs["state"][key] for key in STATE_FIELDS},
+                "vision": {
+                    name: {"color": obs["vision"][name]["color"]} for name in CAMERAS
+                },
+            }
+        super().update_obs(payload, step)
 
     def get_action(self) -> list[dict[str, Any]]:
         self.last_action_info = {}

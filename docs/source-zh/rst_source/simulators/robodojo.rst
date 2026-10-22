@@ -480,3 +480,55 @@ RoboDojo 场景还会引用 NVIDIA 提供的三维模型、材质和贴图。这
 这会将 RoboDojo 匹配的 5.0 在线资源地址改为本地路径。它并不代表所有 Isaac Sim 资源均可离线使用；\
 若仍有其他在线资源加载失败（例如 ``Assets/Isaac/5.1`` 路径），需另外准备对应版本的资产并配置本地加载，\
 见 `NVIDIA 本地资产说明 <https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_faq.html#isaac-sim-setup-assets-content-pack>`_。
+
+VLA Agent 协作
+--------------
+
+在有状态 Policy 运行中加入 ``--vla-agent``，可通过现有 Planner 和 Toolkit
+启用阶段规划、主动混合控制和执行后检查。Agent 可以从 primitive 或
+``run_policy`` 开始。阶段文本仅用于 Agent 决策；每次 Policy 观测都保留原始
+完整任务指令，不改写为子指令。此模式显式启用，与纯 Policy 透传和其他模型
+专属工作流分别保留。
+
+例如，连接为本次运行准备的独立仿真和官方 Policy 服务：
+
+.. code-block:: bash
+
+   rpent --robot robodojo --planner codex --model gpt-6-astra \
+     --reasoning-effort high --task stack_blocks_by_language --layout 0 \
+     --policy-backend awomo05 --policy-server-url ws://127.0.0.1:9000 \
+     --env-endpoint http://127.0.0.1:9001 --vla-agent \
+     --agent-tools policy motion geometry --agent-max-calls 120 \
+     --agent-timeout-s 1800 --planner-timeout-s 1800
+
+桥接需要独立解释器或源码目录时，沿用 ``--policy-python`` 和
+``--xpolicylab-root``。也可以用 ``--vla-endpoint`` 连接经能力验证的 RPent
+桥接端点，它与 ``--policy-server-url`` 互斥。同一回合内不切换模型。
+
+``policy`` 提供 ``run_policy``，``motion`` 提供六项机器人 primitive，
+``geometry`` 提供保存帧上的深度反投影与世界坐标查询。额外选择 ``sam3``
+后注册分割工具并启动或连接其服务。观测、render、计划、检查和 finish 始终
+注册。三个相机均需提供 RGB、匹配的深度及有效标定。定位使用同一保存观测
+索引，该索引不同于原生动作计数。Awomo 适配层过滤额外感知字段，保持官方
+RGB、关节状态与语言输入。
+
+Agent 使用 ``set_stage_plan``，控制调用通过 ``decision`` 提供阶段与预期
+变化；``decision.review`` 或 ``review_execution`` 记录前次结果 ID、可观察
+依据、阶段状态与下一步。``agent-decisions.json`` 将这些记录与实际工具反馈
+一起保存。相机和深度产物仍保存在原有状态轨迹中。``finish`` 记录 Agent 判断，
+运行器单独记录原生成功结果。日志已关闭但 ``finished`` 不为 ``true``，表示
+运行器清理时尚未收到被接受的 Agent finish。
+
+所有控制共享回合的原生动作预算，另有 Agent 调用数与墙钟限制。逐动作检查
+墙钟期限，Planner 超时后取消执行；正在进行的推理或 RPC 需要返回或超时后
+才能完成清理。Policy 预算暂停后，仅在环境未额外推进时保留剩余动作。
+primitive 或 hold 实际接管时使旧动作失效，逐步反馈观测，不 reset 模型。
+未执行的错误保留同步状态。RPC 不确定、反馈缺失或观测交付失败会阻止后续
+执行；Agent 应报告并 finish，不得自动重试。返回的 ``execution`` 计数表示
+已确认动作，不把结果不确定的远程动作算作已确认执行。
+
+此策略不提供配方或历史记忆工具。API Planner 使用新会话；Codex 使用临时
+线程，禁用记忆、项目技能、外部应用以及原生文件和 shell 工具，仅注册本次
+运行的 RPent MCP 服务，沿用现有登录和 provider。此模式当前支持 ``api``
+与 ``codex`` Planner。离线契约测试和确定性 Planner 测试验证执行行为；模型
+兼容性与任务成功率仍需单独的真实 episode 评测。

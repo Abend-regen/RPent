@@ -55,6 +55,20 @@ class RoboDojoEnvClient(BaseEnvClient):
     def get_status(self) -> dict[str, Any]:
         return self._client.call("env.get_status")
 
+    def get_execution_state(self) -> dict[str, Any]:
+        """Read confirmed collaboration progress without an RPC or model update."""
+        with self._execution_lock:
+            monitor = self._execution
+            if monitor is None:
+                raise RuntimeError("No execution observer is registered")
+            return {
+                "confirmed_step": monitor.step,
+                "synchronization_trusted": monitor.trusted,
+                "episode_ended": monitor.ended,
+                "paused": monitor.paused,
+                "closed": monitor.closed,
+            }
+
     def get_motion_state(self) -> dict[str, Any]:
         return self._client.call("env.get_motion_state")
 

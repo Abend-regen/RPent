@@ -26,6 +26,18 @@ from rpent.prompt.utils import PromptNode
 def system_prompt(
     variables: Mapping[str, object] | None = None,
 ) -> PromptNode:
+    if (variables or {}).get("vla_agent"):
+        from rpent.prompt.vla_agent import VLA_COLLABORATION
+
+        return {
+            "VLA COLLABORATION": VLA_COLLABORATION,
+            "ROBOT": system_parts.ROLE_AND_RULES,
+            "OBSERVATIONS": system_parts.TOOL_ACCESS,
+            "PERCEPTION": system_parts.PERCEPTION,
+            "ROBOT TOOLS": system_parts.TOOLS,
+            "GEOMETRY LIMITS": system_parts.SAFETY,
+            "CONFIGURATION": "Enabled tool groups: {{agent_tools}}. Only registered tools are available.",
+        }
     if (variables or {}).get("policy_backend") == "awomo05":
         return {
             "POLICY EXECUTION": system_parts.AWOMO_POLICY,
@@ -63,6 +75,10 @@ def system_prompt(
 def user_prompt(
     variables: Mapping[str, object] | None = None,
 ) -> PromptNode:
+    if (variables or {}).get("vla_agent"):
+        return {
+            "BEGIN": "Read view_env_state for the original task and current images, create a stage plan, and solve this episode through the configured tools. Your first control may be a policy call or a primitive."
+        }
     sections = {
         "TASK": user_parts.TASK,
         "BEGIN": user_parts.BEGIN,

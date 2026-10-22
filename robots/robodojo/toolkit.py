@@ -55,8 +55,15 @@ class RoboDojoToolkit(Toolkit):
         state_output_dir: Path | str | None = None,
     ) -> None:
         self.eval_fair = eval_fair
+        self._agent = None
+        self._finalizing = False
+        self.vla_agent = primitives_kwargs.get("vla_agent", False)
+        self.registered_tools_only = self.vla_agent
         self._stateful_policy = primitives_kwargs.get("stateful_policy", False)
-        self._policy_only = primitives_kwargs.get("policy_backend") == "awomo05"
+        self._resume_chunks = primitives_kwargs.get("policy_backend") == "awomo05"
+        self._policy_only = self._resume_chunks and not self.vla_agent
+        if self.vla_agent and not self._stateful_policy:
+            raise ValueError("VLA Agent requires a stateful policy backend")
         if self._stateful_policy and eval_fair:
             raise ValueError("Stateful policy execution is not supported in eval-fair")
         if eval_fair and not getattr(primitives_kwargs.get("env"), "eval_fair", False):
@@ -69,6 +76,12 @@ class RoboDojoToolkit(Toolkit):
         )
         self.init_primitives(primitives_kwargs=primitives_kwargs)
         self._register_robodojo_tools()
+        if self.vla_agent:
+            try:
+                self._configure_agent(primitives_kwargs, state_output_dir)
+            except Exception:
+                self._primitives.env.end_execution()
+                raise
         if eval_fair:
             allowed = OBSERVATION_TOOLS | MOTION_TOOLS | {"finish", "render"}
             self._tools = {
@@ -76,11 +89,51 @@ class RoboDojoToolkit(Toolkit):
             }
 
     def execute_tool(self, name, input_dict):
-        result = super().execute_tool(name, input_dict)
+        if self._agent is not None:
+            try:
+                return self._agent.dispatch(
+                    name,
+                    input_dict,
+                    self._execute_registered,
+                    mutating=name in MOTION_TOOLS | {"run_policy"},
+                )
+            except Exception as exc:
+                # The action may already have completed when journal/feedback
+                # delivery fails. Preserve confirmed progress and fail closed.
+                self._primitives.env.invalidate_execution(str(exc))
+                return ToolResult(
+                    data={
+                        "error": str(exc),
+                        **self._primitives.env.get_execution_state(),
+                    }
+                )
+        return self._execute_registered(name, input_dict)
+
+    def _execute_registered(self, name, input_dict):
+        before = self._primitives.env.get_execution_state() if self.vla_agent else None
+        self._finalizing = name == "finish"
+        try:
+            result = super().execute_tool(name, input_dict)
+        finally:
+            self._finalizing = False
+        if self.vla_agent and result.data.get("state_capture_error"):
+            self._primitives.env.invalidate_execution(
+                "Agent observation delivery failed"
+            )
+            result.data["synchronization_trusted"] = False
         if name == "finish" and result.data.get("_finish"):
             end = getattr(self._primitives.env, "end_execution", None)
             if end is not None:
                 end()
+        if self.vla_agent:
+            after = self._primitives.env.get_execution_state()
+            result.data.pop("inferences", None)
+            result.data["execution"] = {
+                **after,
+                "step_before": before["confirmed_step"],
+                "step_after": after["confirmed_step"],
+                "confirmed_actions": after["confirmed_step"] - before["confirmed_step"],
+            }
         if not self.eval_fair and name in {
             "segment",
             "back_project",
@@ -101,6 +154,45 @@ class RoboDojoToolkit(Toolkit):
                     )
                 )
         return result
+
+    def raise_if_cancelled(self):
+        super().raise_if_cancelled()
+        if self._agent is not None and not self._finalizing:
+            self._agent.check_deadline()
+
+    def _configure_agent(self, kwargs, state_output_dir):
+        from rpent.tools.vla_agent import AgentCollaboration, finish, with_decision
+
+        groups = set(kwargs.get("agent_tools", ("policy", "motion", "geometry")))
+        choices = {
+            "policy": {"run_policy"},
+            "motion": MOTION_TOOLS,
+            "geometry": {"back_project", "sample_world_xyz", "query_world_map"},
+            "sam3": {"segment"},
+        }
+        if not groups or groups - choices.keys():
+            raise ValueError("Unknown or empty Agent tool groups")
+        if "sam3" in groups and self._primitives.sam3_client is None:
+            raise ValueError("The sam3 tool group requires a SAM3 service")
+        obs = self._primitives._last_obs
+        from robots.robodojo.access import validate_rgbd
+
+        validate_rgbd(obs)
+        allowed = {"view_env_state", "render", "finish"}.union(
+            *(choices[g] for g in groups)
+        )
+        self._tools = {
+            name: with_decision(entry)
+            for name, entry in self._tools.items()
+            if name in allowed
+        }
+        self.add_tool(with_decision(finish), replace=True)
+        self._agent = AgentCollaboration(
+            Path(state_output_dir or get_output_dir()),
+            max_calls=kwargs.get("agent_max_calls", 120),
+            timeout_s=kwargs.get("agent_timeout_s", 1800),
+        )
+        self.add_tools(iter_tools(self._agent))
 
     def flash_observation(self) -> dict:
         """Refresh the public observation used by live Flash grounding."""
@@ -129,7 +221,7 @@ class RoboDojoToolkit(Toolkit):
                 env,
                 RoboDojoPolicyAdapter(policy, stateful=True),
                 self.raise_if_cancelled,
-                resume_chunks=self._policy_only,
+                resume_chunks=self._resume_chunks,
             )
         observer = primitives_kwargs.get("execution_observer")
         if observer is not None:
@@ -142,6 +234,7 @@ class RoboDojoToolkit(Toolkit):
             action_type=primitives_kwargs.get("action_type", "joint"),
             check_cancelled=self.raise_if_cancelled,
         )
+        self._primitives.require_rgbd = self.vla_agent
         try:
             self._publish_step(
                 robodojo_tools.dump_state(self._primitives, self._state, log=None)
@@ -156,9 +249,13 @@ class RoboDojoToolkit(Toolkit):
         try:
             super().close()
         finally:
-            end = getattr(self._primitives.env, "end_execution", None)
-            if end is not None:
-                end()
+            try:
+                end = getattr(self._primitives.env, "end_execution", None)
+                if end is not None:
+                    end()
+            finally:
+                if self._agent is not None:
+                    self._agent.close()
 
     def cancel_active_and_wait(self) -> None:
         super().cancel_active_and_wait()
@@ -238,6 +335,15 @@ class RoboDojoToolkit(Toolkit):
     ) -> ToolResult:
         from robots.robodojo import tools as robodojo_tools
 
+        if self.vla_agent:
+            result = dict(result)
+            if "episode_status" in result:
+                result["episode_status"] = {
+                    k: v
+                    for k, v in result["episode_status"].items()
+                    if k in {"step", "step_limit"}
+                }
+            result.pop("inferences", None)
         record = robodojo_tools.dump_state(
             self._primitives,
             self._state,

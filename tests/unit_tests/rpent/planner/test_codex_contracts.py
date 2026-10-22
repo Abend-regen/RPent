@@ -1227,3 +1227,28 @@ def test_retry_error_is_visible_without_poisoning_successful_turn():
     )
     assert "Retries exhausted" in recorder.error
     assert "Model connection failed" in str(sink.events[-1])
+
+
+def test_registered_tool_session_is_ephemeral_and_excludes_memory(
+    tmp_path, monkeypatch
+):
+    configs = install_fake_backend(monkeypatch)
+    kit = FakeToolkit()
+    kit.registered_tools_only = True
+    planner = make_planner(tmp_path, RecordingSink())
+    planner.solve(
+        system_prompt="Robot task", user_message="Proceed", toolkit=kit, max_turns=3
+    )
+    options = FakeCodex.instances[-1].thread_options
+    assert options["ephemeral"] is True
+    assert options["cwd"] == str(tmp_path / "planner-work")
+    overrides = configs[-1]["config_overrides"]
+    for key in (
+        "memories.use_memories",
+        "memories.generate_memories",
+        "features.shell_tool",
+        "features.plugins",
+    ):
+        assert key + "=false" in overrides
+    mcp = next(x for x in overrides if x.startswith("mcp_servers={"))
+    assert "required=true" in mcp and 'default_tools_approval_mode="approve"' in mcp

@@ -705,3 +705,66 @@ still fail to load, such as ``Assets/Isaac/5.1`` paths, prepare assets for that
 version and configure local loading separately. See the
 `NVIDIA local asset instructions
 <https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_faq.html#isaac-sim-setup-assets-content-pack>`_.
+
+VLA Agent collaboration
+-----------------------
+
+Add ``--vla-agent`` to a stateful-policy run to enable stage planning, active
+mixed control, and observation-based review through the existing Planner and
+Toolkit. The Agent may start with a primitive or ``run_policy``. Stage text
+never becomes a policy subinstruction: every policy observation retains the
+original complete task instruction. This opt-in workflow is separate from the
+policy-only passthrough and other model-specific workflows.
+
+For example, connect dedicated existing simulator and official policy services:
+
+.. code-block:: bash
+
+   rpent --robot robodojo --planner codex --model gpt-6-astra \
+     --reasoning-effort high --task stack_blocks_by_language --layout 0 \
+     --policy-backend awomo05 --policy-server-url ws://127.0.0.1:9000 \
+     --env-endpoint http://127.0.0.1:9001 --vla-agent \
+     --agent-tools policy motion geometry --agent-max-calls 120 \
+     --agent-timeout-s 1800 --planner-timeout-s 1800
+
+Use the existing ``--policy-python`` and ``--xpolicylab-root`` options when the
+bridge needs a separate interpreter or source checkout. Alternatively,
+``--vla-endpoint`` connects a capability-validated RPent bridge; it is mutually
+exclusive with ``--policy-server-url``. There is no within-episode model switch.
+
+``policy`` exposes ``run_policy``; ``motion`` exposes the six robot primitives;
+``geometry`` exposes saved-frame depth projection and world-map queries.
+``sam3`` additionally exposes segmentation and starts/connects its service.
+View, render, plan, review, and finish are always registered. All three cameras
+must supply RGB, matching depth, and finite calibration. Geometry queries use
+one saved observation index, which is distinct from the native action counter.
+The model adapter excludes this extra perception data from Awomo's official
+RGB/joint-state/language input.
+
+The Agent uses ``set_stage_plan`` and supplies a ``decision`` object with the
+stage and expected change on control calls. ``decision.review`` or
+``review_execution`` records the preceding result's ID, observable evidence,
+stage status, and next step. ``agent-decisions.json`` records these statements
+alongside actual tool feedback. Camera/depth artifacts remain in the ordinary
+state trace. ``finish`` records the Agent's assessment; the runner records native
+success separately. A closed journal without ``finished=true`` means the runner
+closed an attempt without an accepted Agent finish.
+
+All controls share the native episode action budget. Call and wall-clock limits
+are additional limits; wall-clock expiry is checked between native actions and
+the planner cancels active work at its timeout. An in-flight inference/RPC must
+settle or time out before cleanup completes. Budget-paused policy calls retain
+remaining actions only while the environment is unchanged. Actual primitive or
+hold takeover discards them, delivers each action's observation, and does not
+reset the model. No-execution errors preserve synchronization. Uncertain RPCs,
+missing feedback or observation delivery errors block further execution; the
+Agent must report and finish, not retry. Returned ``execution`` counts refer to
+confirmed actions, so an uncertain remote action is not reported as confirmed.
+
+This strategy has no recipe or historical memory tools. API planning starts a
+fresh conversation. Codex uses an ephemeral thread with memory, project skills,
+external apps and native file/shell tools disabled; only the run's RPent MCP
+server is registered. The existing login/provider is retained. Only ``api`` and
+``codex`` planners are currently supported for this opt-in workflow. Offline
+contract tests and deterministic Planner tests establish execution behavior;
+model compatibility and task success require separate real-episode evaluation.
