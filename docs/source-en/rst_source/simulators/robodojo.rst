@@ -399,6 +399,80 @@ actions while retaining both arms' and grippers' control targets. Simulation
 continues; measured poses and objects need not stay still. Episode
 termination, the action budget or cancellation can stop execution early.
 
+Awomo05 and agent collaboration
+-------------------------------
+
+Select ``--vla-backend awomo05`` to use the official Awomo05 joint policy.
+The default remains ``vpp2``. Awomo uses its own weights in a separately managed
+model process; it does not load or check ``VPP2_MODEL_PATH`` or ``--vla-model-path``.
+Use the official XPolicyLab Awomo05 environment, checkpoint, normalization
+statistics, FLUX.2 base/autoencoder and Qwen3-VL weights. Preserve its BGR input
+configuration, 25 Hz history, native joint layout and official task instruction.
+No RPent-side image transform or action-vector reordering is applied.
+
+Start the metadata-enabled model wrapper in the Awomo environment, with the
+XPolicyLab checkout and its parent on ``PYTHONPATH``::
+
+   python /path/to/RPent/robots/robodojo/awomo05_policy_server.py \
+     --config_path /path/to/XPolicyLab/policy/Awomo05/deploy.yml \
+     --host 127.0.0.1 --port 9005 --overrides \
+     policy_name=Awomo05 bench_name=RoboDojo task_name=general_pickup \
+     env_cfg_type=arx_x5 action_type=joint seed=0 ckpt=model.pt \
+     input_color_order=bgr replan_steps=8
+
+Choose one connection mode:
+
+- ``--policy-server-url ws://127.0.0.1:9005`` borrows the upstream model and starts
+  an RPent bridge. Set ``--xpolicylab-root`` and ``--policy-python`` to the bridge
+  environment (RPC and XPolicyLab WebSocket dependencies; no model weights needed).
+- ``--vla-endpoint http://host:port`` or ``socket://host:port`` borrows an RPent RPC
+  service implementing the Awomo session and metadata contract. It is not an
+  upstream WebSocket URL. The two endpoint options are mutually exclusive.
+
+For example::
+
+   rpent --robot robodojo --planner api --model openai-chat:MODEL \
+     --task general_pickup --vla-backend awomo05 \
+     --policy-server-url ws://127.0.0.1:9005 \
+     --xpolicylab-root /path/to/XPolicyLab --policy-python /path/to/bridge/bin/python \
+     --vla-agent --agent-tools policy motion geometry
+
+Without ``--vla-agent``, the toolkit exposes ``run_policy(max_steps)`` and
+observation/finish tools. With it, the existing planner and toolkit dispatch
+stage planning, evidence reviews and the selected policy, motion, geometry or
+SAM3 tools. ``--agent-max-calls`` and ``--agent-timeout-s`` bound collaboration.
+Each new control decision must review the preceding feedback; inspect fresh
+images and confirmed action counts. Agent assessment and native success are
+recorded separately. Agent runs use fresh memory; historical memory arguments
+and exploration are rejected. API and Codex planners are supported.
+
+Awomo continues unconsumed chunks across bounded ``run_policy`` calls. Reads do
+not add observations. A primitive discards pending actions but delivers its
+confirmed observation without resetting model history. Cancellation discards
+pending actions; uncertain execution or observation delivery requires reset.
+Normal startup selects Env and Awomo; agent mode adds SAM3 only when requested.
+Dashboard component selection uses the same backend starter and connector.
+
+RPent stops bridges it started and releases session ownership at task close.
+Borrowed RPC/model services remain running; their operator owns shutdown. Startup
+failure closes pending RPC sessions and stops already started components.
+
+Bounded verification
+~~~~~~~~~~~~~~~~~~~~
+
+With dedicated GPUs, simulator assets and the real model endpoint configured::
+
+   RPENT_RUN_AWOMO05_INTEGRATION=1 \
+   RPENT_AWOMO05_POLICY_SERVER_URL=ws://127.0.0.1:9005 \
+   RPENT_XPOLICYLAB_ROOT=/path/to/XPolicyLab \
+   RPENT_E2E_OUTPUT_DIR=/path/to/new-output \
+     pytest tests/e2e_tests/robodojo/test_awomo_bounded.py -v -s
+
+The component test checks real inference, chunk continuation, primitive takeover
+and reset. The public CLI test uses a local scripted planner for
+policy → primitive → policy → finish, checking images, trace, action counts and
+cleanup. These checks are integration evidence, not task-success benchmarks.
+
 .. _robodojo-local-nvidia-assets:
 
 Prepare Local NVIDIA Scene Assets (Optional)

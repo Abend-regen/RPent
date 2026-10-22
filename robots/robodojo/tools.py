@@ -740,10 +740,19 @@ def dump_state(primitives, state, *, log: dict | None = None, perception=None):
     """
     obs = _refresh_obs(primitives)
     status = primitives.env.get_status()
+    if getattr(primitives, "require_rgbd", False):
+        from robots.robodojo.access import validate_rgbd
+
+        validate_rgbd(obs)
     log = log or {}
     summary = _summarize_obs(obs)
     step_idx = 0 if state.latest_step is None else state.latest_step + 1
     summary.update(step_idx=step_idx, artifacts={}, view_specs={})
+    summary["control"] = {
+        "step": status["step"],
+        "step_limit": status["step_limit"],
+        "remaining_steps": max(0, status["step_limit"] - status["step"]),
+    }
     views = {}
     for camera, cam in obs.get("vision", {}).items():
         if camera not in dict(CAMERA_ARTIFACTS):

@@ -26,6 +26,24 @@ from rpent.prompt.utils import PromptNode
 def system_prompt(
     variables: Mapping[str, object] | None = None,
 ) -> PromptNode:
+    if (variables or {}).get("vla_agent"):
+        from robots.robodojo.prompts.collaboration import VLA_COLLABORATION
+
+        return {
+            "VLA COLLABORATION": VLA_COLLABORATION,
+            "ROBOT": system_parts.ROLE_AND_RULES,
+            "OBSERVATIONS": system_parts.TOOL_ACCESS,
+            "PERCEPTION": system_parts.PERCEPTION,
+            "ROBOT TOOLS": system_parts.TOOLS.split("\nvpp2_act(", 1)[0],
+            "GEOMETRY LIMITS": system_parts.SAFETY,
+            "CONFIGURATION": "Enabled tool groups: {{agent_tools}}. Only registered tools are available.",
+        }
+    if (variables or {}).get("vla_backend") == "awomo05":
+        return {
+            "POLICY EXECUTION": system_parts.AWOMO_POLICY,
+            "REWARD AND SCORE": system_parts.REWARD,
+            "OUTPUT DISCIPLINE": system_parts.OUTPUT_DISCIPLINE,
+        }
     sections = {
         "ROLE AND RULES": system_parts.ROLE_AND_RULES,
         "TOOL ACCESS": system_parts.TOOL_ACCESS,
@@ -49,6 +67,18 @@ def system_prompt(
 def user_prompt(
     variables: Mapping[str, object] | None = None,
 ) -> PromptNode:
+    if (variables or {}).get("vla_agent"):
+        return {
+            "BEGIN": "Read view_env_state for the original task and current images, create a stage plan, then solve through the configured tools."
+        }
+    if (variables or {}).get("vla_backend") == "awomo05":
+        return {
+            "TASK": user_parts.TASK.replace(
+                "analytic joint targets and VPP2 native EE16 targets",
+                "Awomo05 native joint policy",
+            ),
+            "BEGIN": user_parts.POLICY_BEGIN,
+        }
     sections = {
         "TASK": user_parts.TASK,
         "BEGIN": user_parts.BEGIN,

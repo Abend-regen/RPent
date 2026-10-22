@@ -113,6 +113,7 @@ class CodexPlanner(Planner):
         self._api_key = os.environ.get("CODEX_API_KEY", None)
         self._service_tier = os.environ.get("CODEX_SERVICE_TIER", None)
         self._dashboard_events = dashboard_events
+        self._registered_tools_only = False
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"unsupported reasoning effort: {reasoning_effort}")
         self._thread_options = {
@@ -127,6 +128,8 @@ class CodexPlanner(Planner):
             **self._thread_options,
             "effort": getattr(ReasoningEffort, reasoning_effort),
         }
+        self._default_thread_options = dict(self._thread_options)
+        self._default_turn_options = dict(self._turn_options)
 
     def solve(
         self,
@@ -142,6 +145,21 @@ class CodexPlanner(Planner):
         if input_queue is not None and dashboard_interaction is not None:
             raise ValueError(
                 "input_queue and dashboard_interaction cannot be used together"
+            )
+        self._registered_tools_only = getattr(toolkit, "registered_tools_only", False)
+        self._thread_options = dict(self._default_thread_options)
+        self._turn_options = dict(self._default_turn_options)
+        if self._registered_tools_only:
+            work = Path(self._output_dir) / "planner-work"
+            work.mkdir(parents=True, exist_ok=True)
+            self._thread_options.update(
+                cwd=str(work),
+                sandbox=openai_codex.Sandbox.read_only,
+                ephemeral=True,
+                base_instructions="You are a robot task planner. Follow the supplied task and tool contracts. Use only the registered RPent tools.",
+            )
+            self._turn_options.update(
+                cwd=str(work), sandbox=openai_codex.Sandbox.read_only
             )
         prompt = f"{system_prompt}\n\n{user_message}" if system_prompt else user_message
         if dashboard_interaction is not None:
@@ -496,7 +514,9 @@ class CodexPlanner(Planner):
             mcp_url=mcp_url,
             base_url=self._base_url,
             api_key=self._api_key,
-            cwd=self._repo_root,
+            cwd=self._thread_options["cwd"],
+            registered_tools_only=self._registered_tools_only,
+            tool_timeout_s=self._timeout_s,
         )
 
 
@@ -858,6 +878,8 @@ def build_codex_config(
     base_url: str | None,
     api_key: str | None,
     cwd: str,
+    registered_tools_only: bool = False,
+    tool_timeout_s: int = 600,
 ) -> Any:
     """Build the Codex SDK config shared by the planner and the check.
 
@@ -884,6 +906,49 @@ def build_codex_config(
     ]
     if disabled_skills:
         config_overrides.append(f"skills.config=[{', '.join(disabled_skills)}]")
+    if registered_tools_only:
+        # Per-session overrides: retain login/provider, exclude historical context
+        # and native tools that could bypass the robot's registered execution path.
+        config_overrides.extend(
+            [
+                'web_search="disabled"',
+                "memories.use_memories=false",
+                "memories.generate_memories=false",
+                "memories.dedicated_tools=false",
+                "features.skip_host_skill_discovery=true",
+                'developer_instructions=""',
+                (
+                    "mcp_servers={rpent={url="
+                    + json.dumps(mcp_url)
+                    + ', required=true, default_tools_approval_mode="approve", tool_timeout_sec='
+                    + str(tool_timeout_s + 30)
+                    + "}}"
+                )
+                if mcp_url
+                else "mcp_servers={}",
+            ]
+        )
+        config_overrides.extend(
+            f"features.{name}=false"
+            for name in (
+                "shell_tool",
+                "unified_exec",
+                "view_image",
+                "apps",
+                "browser_use",
+                "browser_use_external",
+                "computer_use",
+                "remote_plugin",
+                "plugins",
+                "skill_search",
+                "multi_agent",
+                "image_generation",
+                "goals",
+                "sleep_tool",
+                "shell_snapshot",
+                "in_app_browser",
+            )
+        )
     kwargs: dict[str, Any] = {
         "config_overrides": tuple(config_overrides),
         "cwd": cwd,

@@ -89,3 +89,16 @@ OUTPUT_DISCIPLINE = """Record the observed outcome and uncertainties in
 {{output_dir}}/{{recipe_tag}}.json, then call finish(status, summary).
 Do not claim success from a successful tool call alone. reset is unavailable
 in this integration."""
+
+
+AWOMO_POLICY = """Execute the configured policy using the environment's original
+task instruction. Read `view_env_state` first. Call `run_policy(max_steps)` to
+advance a bounded number of control steps. A budget return pauses execution;
+continue calling the same tool until `episode_ended` is true.
+Keep the task instruction unchanged. The policy owns its internal subtask
+reasoning. Do not rewrite goals, insert scripted recovery actions, or finish
+early because an object has been grasped. On cancellation or error, report the
+interruption without retrying uncertain policy state or resetting the episode.
+Read-only inspection does not advance the policy's observation history.
+The runner owns service startup and shutdown. Episode end is not proof of
+task success."""

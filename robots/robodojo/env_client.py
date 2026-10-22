@@ -359,3 +359,38 @@ class RoboDojoEnvClient(BaseEnvClient):
     def hold_step(self):
         """Advance one native action while retaining both arms' controller targets."""
         return self._call_action("env.hold_step", kwargs={}, source="hold")
+
+    def get_execution_state(self) -> dict[str, Any]:
+        """Read confirmed collaboration progress without an RPC or model update."""
+        with self._execution_lock:
+            monitor = self._execution
+            if monitor is None:
+                raise RuntimeError("No execution observer is registered")
+            return {
+                "confirmed_step": monitor.step,
+                "synchronization_trusted": monitor.trusted,
+                "episode_ended": monitor.ended,
+                "paused": monitor.paused,
+                "closed": monitor.closed,
+            }
+
+    def invalidate_execution(self, reason: str) -> None:
+        """Latch control closed after the adapter reports uncertain model state."""
+        with self._execution_lock:
+            self._history_valid = False
+            if self._execution is not None and self._execution.trusted:
+                self._execution.lost(reason)
+
+    def unregister_execution_observer(self, callback) -> None:
+        """Release a closed observer while retaining runtime-owned environment/history."""
+        with self._execution_lock:
+            monitor = self._execution
+            if monitor is None or monitor.callback != callback:
+                return
+            if monitor.delivering:
+                raise RuntimeError("cannot detach during execution feedback")
+            try:
+                self.end_execution()
+            finally:
+                self._history_valid = self._history_valid and monitor.trusted
+                self._execution = None

@@ -20,6 +20,7 @@ import argparse
 import os
 import subprocess
 import sys
+from contextlib import suppress
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -65,7 +66,7 @@ ROBODOJO_DASHBOARD_SPEC: DashboardSpec = {
     "runtime_components": (
         {"name": "env", "label": "ENV", "scope": "unique"},
         {"name": "sam3", "label": "SAM3", "scope": "shared"},
-        {"name": "vla", "label": "VPP2", "scope": "shared"},
+        {"name": "vla", "label": "VLA", "scope": "shared"},
     ),
     "frame_channels": (
         {
@@ -98,6 +99,7 @@ ROBODOJO_DASHBOARD_SPEC: DashboardSpec = {
         "set_gripper",
         "release",
         "vpp2_act",
+        "run_policy",
     ),
 }
 
@@ -148,6 +150,7 @@ def get_robot_spec() -> RobotSpec:
         init_runtime=_init_runtime,
         dashboard=ROBODOJO_DASHBOARD_SPEC,
         validate_args=_validate_args,
+        prepare_memory=_prepare_memory,
         finalize_run=finalize_run,
     )
 
@@ -183,6 +186,41 @@ def _validate_args(args: argparse.Namespace) -> None:
     for name in ("seed", "layout"):
         if getattr(args, name, 0) < 0:
             raise ValueError(f"{name} must be nonnegative")
+
+    from urllib.parse import urlsplit
+
+    backend = getattr(args, "vla_backend", "vpp2")
+    upstream = getattr(args, "policy_server_url", None)
+    endpoint = getattr(args, "vla_endpoint", None)
+    if upstream and endpoint:
+        raise ValueError(
+            "--vla-endpoint and --policy-server-url are mutually exclusive"
+        )
+    if upstream and backend != "awomo05":
+        raise ValueError("--policy-server-url requires --vla-backend awomo05")
+    if backend == "awomo05":
+        if not (upstream or endpoint):
+            raise ValueError("awomo05 requires --vla-endpoint or --policy-server-url")
+        if args.env_cfg_type != "arx_x5" or args.action_type != "joint":
+            raise ValueError("awomo05 requires arx_x5 with absolute joint actions")
+        if upstream and (
+            urlsplit(upstream).scheme not in {"ws", "wss"}
+            or not urlsplit(upstream).hostname
+        ):
+            raise ValueError("--policy-server-url must be a ws:// or wss:// URL")
+    if getattr(args, "vla_agent", False):
+        if backend != "awomo05":
+            raise ValueError("--vla-agent requires --vla-backend awomo05")
+        if args.agent_max_calls < 1 or args.agent_timeout_s < 1:
+            raise ValueError("Agent budgets must be positive")
+        if (
+            getattr(args, "explore", False)
+            or getattr(args, "memory_repo", None)
+            or getattr(args, "memory_dir", None)
+        ):
+            raise ValueError("VLA Agent uses a fresh run without historical memory")
+        if getattr(args, "planner", None) == "claude_code":
+            raise ValueError("VLA Agent currently supports api and codex planners")
 
 
 def get_toolkit(
@@ -237,8 +275,9 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
     )
     parser.add_argument(
         "--pi05-python",
+        "--policy-python",
         default=sys.executable,
-        help="Python executable for explicit legacy Pi0.5 diagnostics",
+        help="Python executable for the Awomo bridge or legacy Pi0.5 diagnostics",
     )
     parser.add_argument(
         "--task",
@@ -285,18 +324,40 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         help="[protocol://]host:port of an existing env_server",
     )
     parser.add_argument(
-        "--vla-backend", choices=("vpp2",), default="vpp2", help="VLA policy backend"
+        "--vla-backend",
+        choices=("vpp2", "awomo05"),
+        default="vpp2",
+        help="VLA policy backend",
     )
     parser.add_argument(
         "--vla-model-path",
         default=os.environ.get("VPP2_MODEL_PATH"),
         help="VPP2 resource root containing policy/ and checkpoints/ (or VPP2_MODEL_PATH)",
     )
-    parser.add_argument(
+    policy_endpoint = parser.add_mutually_exclusive_group()
+    policy_endpoint.add_argument(
+        "--policy-server-url",
+        help="ws[s]://host:port of a separately managed Awomo05 model",
+    )
+    policy_endpoint.add_argument(
         "--vla-endpoint",
         default=None,
-        help="socket://host:port of an existing VPP2 server",
+        help="[protocol://]host:port of an existing RPent VLA RPC server",
     )
+    parser.add_argument(
+        "--vla-agent",
+        action="store_true",
+        help="Enable stage planning and mixed Awomo/primitive control",
+    )
+    parser.add_argument(
+        "--agent-tools",
+        nargs="+",
+        choices=("policy", "motion", "geometry", "sam3"),
+        default=["policy", "motion", "geometry"],
+        help="Enabled collaboration tool groups",
+    )
+    parser.add_argument("--agent-max-calls", type=int, default=120)
+    parser.add_argument("--agent-timeout-s", type=int, default=1800)
     parser.add_argument(
         "--sam3-endpoint",
         default=None,
@@ -312,7 +373,11 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
     if err:
         raise ValueError(err)
     eval_fair = getattr(args, "planner", None) == "flash"
-    summary = {} if eval_fair else robodojo_tasks.task_summary(args.task, source_root)
+    summary = (
+        {}
+        if eval_fair or getattr(args, "vla_agent", False)
+        else robodojo_tasks.task_summary(args.task, source_root)
+    )
     seed = getattr(args, "seed", 0)
     recipe_tag = f"{args.task}_s{seed}_l{args.layout}"
     if getattr(args, "random", False):
@@ -340,6 +405,11 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
             "task_summary": summary,
             "memory_dir": str(memory_dir),
             "mode": "eval-fair" if eval_fair else "dev",
+            "vla_backend": args.vla_backend,
+            "vla_agent": getattr(args, "vla_agent", False),
+            "agent_tools": getattr(
+                args, "agent_tools", ["policy", "motion", "geometry"]
+            ),
         },
         task_desc={
             "task": args.task,
@@ -558,7 +628,9 @@ def _init_runtime(
     from robots.robodojo.vpp2_client import VPP2Client
     from rpent.robots.components.sam3_client import Sam3Client
 
-    vla_starter = {"vpp2": _spawn_vpp2_server}[args.vla_backend]
+    vla_starter = {"vpp2": _spawn_vpp2_server, "awomo05": _spawn_awomo_server}[
+        args.vla_backend
+    ]
     starters = {
         "env": lambda: _spawn_env_server(args, output_dir),
         "vla": lambda: vla_starter(args, output_dir),
@@ -587,45 +659,97 @@ def _init_runtime(
                 },
             )
         },
-        "vla": lambda rpc: {"vla_client": VPP2Client(rpc)},
+        "vla": lambda rpc: {
+            "vla_client": _connect_awomo(rpc)
+            if args.vla_backend == "awomo05"
+            else VPP2Client(rpc)
+        },
         "sam3": lambda rpc: {"sam3_client": Sam3Client(rpc)},
     }
     timeouts = {"env": 900.0, "sam3": 300.0, "vla": 1800.0}
-    wait_order = ("env", "sam3", "vla")
+    wait_order = (
+        ("vla", "env", "sam3")
+        if args.vla_backend == "awomo05"
+        else ("env", "sam3", "vla")
+    )
     selected = {"env", "sam3", "vla"} if components is None else set(components)
+    if components is None and args.vla_backend == "awomo05":
+        selected = {"env", "vla"}
+        if getattr(args, "vla_agent", False) and "sam3" in args.agent_tools:
+            selected.add("sam3")
     unknown = selected.difference(starters)
     if unknown:
         raise ValueError(f"unknown RoboDojo runtime components: {sorted(unknown)}")
-    if "vla" in selected and args.vla_endpoint is None:
+    if "vla" in selected and args.vla_backend == "vpp2" and args.vla_endpoint is None:
         from robots.robodojo.vpp2_server import model_paths
 
         model_paths(args.vla_model_path)
 
     pending: dict[str, tuple[ProcessDaemon | None, RpcClient]] = {}
     owned_daemons: dict[str, ProcessDaemon] = {}
-    for component, starter in starters.items():
-        if component in selected:
-            pending[component] = try_spawn_server(
+    try:
+        for component, starter in starters.items():
+            if component in selected:
+                pending[component] = try_spawn_server(
+                    owned_daemons,
+                    dashboard_events,
+                    component,
+                    starter,
+                )
+
+        primitives_kwargs: dict[str, Any] = {}
+        for component in (name for name in wait_order if name in pending):
+            daemon, rpc = pending[component]
+            component_kwargs = try_wait_server(
                 owned_daemons,
                 dashboard_events,
                 component,
-                starter,
+                rpc,
+                daemon,
+                timeouts[component],
+                post_fn=partial(connectors[component], rpc),
             )
-
-    primitives_kwargs: dict[str, Any] = {}
-    for component in (name for name in wait_order if name in pending):
-        daemon, rpc = pending[component]
-        component_kwargs = try_wait_server(
-            owned_daemons,
-            dashboard_events,
-            component,
-            rpc,
-            daemon,
-            timeouts[component],
-            post_fn=partial(connectors[component], rpc),
-        )
-        primitives_kwargs.update(component_kwargs)
+            primitives_kwargs.update(component_kwargs)
+    except BaseException:
+        for _, rpc in pending.values():
+            with suppress(Exception):
+                rpc.close()
+        raise
 
     primitives_kwargs["action_type"] = args.action_type
     primitives_kwargs["task"] = args.task
+    primitives_kwargs.update(
+        vla_backend=args.vla_backend,
+        vla_agent=getattr(args, "vla_agent", False),
+        agent_tools=getattr(args, "agent_tools", ["policy", "motion", "geometry"]),
+        agent_max_calls=getattr(args, "agent_max_calls", 120),
+        agent_timeout_s=getattr(args, "agent_timeout_s", 1800),
+    )
     return list(owned_daemons.values()), primitives_kwargs
+
+
+def _prepare_memory(args: argparse.Namespace, config: RunConfig) -> None:
+    """Give collaboration a fresh memory root; delegate ordinary runs unchanged."""
+    if getattr(args, "vla_agent", False):
+        config.prompt_vars["memory_dir"] = str(config.output_dir / "agent-memory")
+        return
+    from dataclasses import replace
+
+    from rpent.memory.loading import prepare_run_memory
+
+    prepare_run_memory(args, replace(get_robot_spec(), prepare_memory=None), config)
+
+
+def _spawn_awomo_server(args: argparse.Namespace, output_dir: Path):
+    """Borrow RPent RPC or own only a bridge to the borrowed upstream model."""
+    if args.vla_endpoint:
+        return None, make_rpc_client(args.vla_endpoint, enable_sessions=True)
+    from robots.robodojo.awomo05 import spawn_bridge
+
+    return spawn_bridge(args, output_dir)
+
+
+def _connect_awomo(rpc: RpcClient):
+    from robots.robodojo.awomo05 import Awomo05Client
+
+    return Awomo05Client(rpc)

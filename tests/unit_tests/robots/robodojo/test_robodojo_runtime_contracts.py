@@ -505,6 +505,7 @@ def test_toolkit_exposes_new_primitives_without_legacy_actions(
         "set_gripper",
         "release",
         "vpp2_act",
+        "run_policy",
     }
 
 
