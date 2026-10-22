@@ -2,8 +2,9 @@ RoboDojo
 ========
 
 Run bimanual tabletop tasks with RPent in RoboDojo. The simulator uses
-Isaac Sim / IsaacLab with an ARX-X5 dual-arm platform. RPent combines VPP2
-policy actions, native motion primitives and SAM3 object segmentation.
+Isaac Sim / IsaacLab with an ARX-X5 dual-arm platform. Choose VPP2 (the default)
+or Awomo05 for policy actions. Native motion primitives and SAM3 segmentation
+are available with VPP2 or the corresponding Awomo agent tool groups.
 
 Overview
 --------
@@ -13,11 +14,11 @@ Overview
 
    .. grid-item-card:: Action Models
 
-      Scripted primitives and VPP2
+      VPP2 (default), Awomo05, and native motion primitives
 
    .. grid-item-card:: Planners
 
-      ``api``, ``claude_code``, ``codex``
+      ``api``, ``claude_code``, ``codex``; Awomo agent mode: ``api`` or ``codex``.
 
    .. grid-item-card:: Tasks
 
@@ -66,11 +67,11 @@ Observation and Action
    * - Observation
      - Head and left/right wrist RGB-D images, camera calibration, and joint states, end-effector poses, and gripper states for both arms.
    * - Action
-     - ``move_to``, ``move_delta``, ``rotate_wrist``, ``set_gripper``, ``release``, ``hold``, and ``vpp2_act``. ``finish`` cannot override the native task verdict.
+     - VPP2: ``vpp2_act`` and native primitives (``move_to``, ``move_delta``, ``rotate_wrist``, ``set_gripper``, ``release``, ``hold``). Awomo05: ``run_policy``; ``--vla-agent`` adds selected motion and perception tools. ``finish`` cannot override the native task verdict.
    * - Reward / success
      - RoboDojo's native environment determines task success, recorded in the ``success`` field of ``result.json``.
    * - Task prompt
-     - The current scene's RoboDojo task description, read through ``view_env_state``.
+     - The current scene's RoboDojo task description, read through ``view_env_state``. Awomo uses the official instruction throughout the episode; VPP2 accepts a subtask instruction.
 
 Installation and Resources
 --------------------------
@@ -165,7 +166,14 @@ For offline use or repeated resource-loading failures, see
 VLA Configuration
 -----------------
 
-VPP2 is the default action model, selected with ``--vla-backend vpp2``.
+Select ``--vla-backend vpp2|awomo05``; omitting it selects ``vpp2``. Follow the
+VPP2 setup below or :ref:`robodojo-awomo-setup`. Awomo does not require VPP2
+weights and does not use ``VPP2_MODEL_PATH`` or ``--vla-model-path``.
+
+VPP2 Setup
+~~~~~~~~~~
+
+VPP2 is selected with ``--vla-backend vpp2``.
 Prepare the official
 `VPP2 RoboDojo implementation <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_
 and the paired 100k weights from
@@ -218,10 +226,83 @@ RPent/simulator environment. RPent starts and stops its own model process;
 independently started services remain under their operator's control.
 For remote deployment, see :doc:`../guides/advanced_deployment`.
 
+.. _robodojo-awomo-setup:
+
+Awomo05 Setup
+~~~~~~~~~~~~~
+
+Use the official `XPolicyLab Awomo05 installation and asset guide
+<https://github.com/XPolicyLab/XPolicyLab/blob/562c14cf08b9e6e411e7d76f192740afced77160/policy/Awomo05/README.md>`_.
+The model environment is separate from Isaac Sim: its installation script pins
+PyTorch 2.8.0, Transformers 5.5.0 and PEFT 0.5.0. The RPent bridge only needs
+RPent and XPolicyLab's WebSocket dependencies, so it can run in the RPent
+simulation environment without installing the Awomo model dependencies there.
+
+The following path starts the model yourself and lets RPent start the bridge.
+Replace the example directories with absolute local paths. Prepare the upstream
+checkout for policy code and robot configuration; RPent still uses the simulator
+installed above:
+
+.. code-block:: bash
+
+   git clone https://github.com/RoboDojo-Benchmark/RoboDojo.git /path/to/RoboDojo
+   git -C /path/to/RoboDojo checkout 2184bf8844ea9d205382c4aefa3a694311418251
+   git -C /path/to/RoboDojo submodule update --init XPolicyLab
+   git -C /path/to/RoboDojo/XPolicyLab fetch origin 562c14cf08b9e6e411e7d76f192740afced77160
+   git -C /path/to/RoboDojo/XPolicyLab checkout 562c14cf08b9e6e411e7d76f192740afced77160
+   uv venv --seed --python 3.11 /path/to/awomo-env
+   source /path/to/awomo-env/bin/activate
+   cd /path/to/RoboDojo/XPolicyLab
+   bash policy/Awomo05/install.sh
+
+Keep ``env_cfg/arx_x5.yml`` in the parent RoboDojo checkout and the XPolicyLab
+robot configuration. Download the released
+`Awomo checkpoint and matching statistics
+<https://huggingface.co/Auwomo/Awomo-0.5-Robodojo>`_ together. Follow the repository's
+access and license requirements. Its downloader verifies ``SHA256SUMS`` and also
+fetches `FLUX.2-klein-base-4B
+<https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4B>`_, the
+`FLUX.2-dev autoencoder <https://huggingface.co/black-forest-labs/FLUX.2-dev>`_,
+and `Qwen3-VL-4B-Instruct <https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct>`_:
+
+.. code-block:: bash
+
+   # In the Awomo environment, from the XPolicyLab root.
+   export AWOMO05_WEIGHTS=/path/to/awomo-weights
+   hf auth login
+   bash policy/Awomo05/download_weights.sh
+   export AWOMO05_FLUX2_BASE="$AWOMO05_WEIGHTS/flux2-klein-base-4b/flux-2-klein-base-4b.safetensors"
+   export AWOMO05_FLUX2_AE="$AWOMO05_WEIGHTS/flux2-dev/ae.safetensors"
+   export AWOMO05_QWEN_VL="$AWOMO05_WEIGHTS/Qwen3-VL-4B-Instruct"
+
+In that same terminal, start RPent's metadata-enabled wrapper. Put both the
+XPolicyLab checkout and its parent on ``PYTHONPATH`` so the official model and
+server imports resolve. Reserve GPU 0 for the model in this example and GPU 1
+for the simulator in :ref:`robodojo-awomo-run`; adjust both to free devices:
+
+.. code-block:: bash
+
+   export PYTHONPATH="/path/to/RoboDojo:/path/to/RoboDojo/XPolicyLab${PYTHONPATH:+:$PYTHONPATH}"
+   CUDA_VISIBLE_DEVICES=0 python /path/to/RPent/robots/robodojo/awomo05_policy_server.py \
+     --config_path /path/to/RoboDojo/XPolicyLab/policy/Awomo05/deploy.yml \
+     --host 127.0.0.1 --port 9005 --overrides \
+     policy_name=Awomo05 bench_name=RoboDojo task_name=general_pickup \
+     env_cfg_type=arx_x5 action_type=joint seed=0 ckpt=model.pt \
+     input_color_order=bgr replan_steps=8
+
+Wait for ``Awomo05 ready`` followed by ``websocket policy server listening``
+in the model terminal. These indicate model initialization and listener startup;
+they do not establish a successful inference. Keep the terminal running.
+The wrapper exposes ``get_model_meta`` for bridge validation. Preserve BGR
+configuration, 25 Hz history, the native joint layout and the official task
+instruction; RPent does not reorder actions or add image transforms.
+If startup fails, use :ref:`robodojo-awomo-troubleshooting` before starting RPent.
+
 SAM3 Configuration
 ------------------
 
-SAM3 provides object segmentation. Request access on the
+SAM3 provides object segmentation. VPP2 starts it by default; Awomo only needs
+it when ``--vla-agent --agent-tools ... sam3`` selects the SAM3 tool group. Request access on the
 `facebook/sam3 model page <https://huggingface.co/facebook/sam3>`_, then
 download ``sam3.pt`` and set its path:
 
@@ -262,6 +343,68 @@ and SAM3, run the bottle-disposal task at seed group 0, layout 0:
      --max-turns 40 --planner-timeout-s 1500 \
      --output-dir /path/to/run-output
 
+.. _robodojo-awomo-run:
+
+Run with Awomo05
+~~~~~~~~~~~~~~~~
+
+After :ref:`robodojo-awomo-setup` reports the model listener ready, open a second
+terminal in the RPent simulation environment created above. Install XPolicyLab's
+transport package into this environment; it does not install the Awomo model:
+
+.. code-block:: bash
+
+   cd /path/to/RPent
+   source .venv-robodojo/bin/activate
+   uv pip install -e /path/to/RoboDojo/XPolicyLab
+   export ROBODOJO_ASSETS_ROOT=/path/to/robodojo
+   export RPENT_RLINF_ROOT="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+   export ROBODOJO_PLACEMENT_SETTLE_STEPS=1000
+   export OMNI_KIT_ACCEPT_EULA=YES
+   rpent-check-llm --planner codex --model <planner-model> --json
+   CUDA_VISIBLE_DEVICES=1 rpent --robot robodojo --vla-backend awomo05 \
+     --task general_pickup --seed 0 --layout 0 \
+     --policy-server-url ws://127.0.0.1:9005 \
+     --xpolicylab-root /path/to/RoboDojo/XPolicyLab \
+     --policy-python /path/to/RPent/.venv-robodojo/bin/python \
+     --planner codex --model <planner-model> --reasoning-effort medium \
+     --max-turns 40 --planner-timeout-s 1500 \
+     --output-dir /path/to/awomo-run-output
+
+Replace ``<planner-model>`` with the configured planner model. This starts the
+environment and a CPU bridge to the already running Awomo model; it needs no
+VPP2 or SAM3 weights. RPent waits for the bridge and validates its metadata
+before execution. Inspect ``awomo05_bridge.log`` and ``robodojo_env_server.log``
+in the output directory if startup stops. The planner can call ``run_policy``,
+read saved state and ``finish``. For mixed control, add
+``--vla-agent --agent-tools policy motion geometry``; see
+:ref:`robodojo-awomo-collaboration` for tool and planner restrictions.
+
+Existing RPC Service (Alternative)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``--vla-endpoint`` denotes RPent RPC, while ``--policy-server-url`` denotes the
+Awomo upstream WebSocket. They are mutually exclusive. To manage the bridge
+separately, install RPent and XPolicyLab's transport package in its environment,
+set the same ``PYTHONPATH`` as above, and start:
+
+.. code-block:: bash
+
+   python -m robots.robodojo.awomo05_bridge --task general_pickup \
+     --policy-server-url ws://127.0.0.1:9005 --host 127.0.0.1 --port 9205
+
+In the task command, replace ``--policy-server-url``, ``--xpolicylab-root`` and
+``--policy-python`` with ``--vla-endpoint http://127.0.0.1:9205``. A compatible
+externally managed service may also use ``socket://host:port``; the bridge
+command above serves HTTP. The RPC protocol must match ``--vla-backend``:
+VPP2 uses the VPP2 protocol, and Awomo uses the session and metadata contract.
+Neither endpoint option points to a model directory.
+
+RPent stops bridges it starts and releases its session at task close. Borrowed
+RPC and model services keep running; their operator owns shutdown. Startup
+failure closes pending RPC sessions and stops components already started by RPent.
+Dashboard uses the same backend-specific starters and connectors.
+
 View Results
 ------------
 
@@ -272,15 +415,22 @@ run, inspect these files in the directory selected by ``--output-dir``:
 - ``states.json``: commands, execution results and synchronized observation records.
 - Per-step RGB, metric depth, calibration and world-xyz artifacts for available cameras.
 - ``videos/``: head, left-wrist, and right-wrist camera videos.
-- ``robodojo_env_server.log``, ``sam3_server.log`` and ``robodojo_vpp2_server.log``:
-  locally owned service startup and error logs.
+- ``robodojo_env_server.log``: simulator startup and errors. VPP2 also writes
+  ``sam3_server.log`` and ``robodojo_vpp2_server.log`` for locally started services.
+  An automatically started Awomo bridge writes ``awomo05_bridge.log``; its
+  separately started model logs to the model terminal. SAM3 logs appear for
+  Awomo only when that component is started.
+- ``agent-decisions.json`` in Awomo agent mode: stage plans, tool feedback and
+  the planner's subsequent reviews.
 - ``run.log`` and ``transcript_*.json``: main-process logs, planner conversations,
   and errors.
 
 Check ``environment_result_available=true`` and
 ``agent_error_present=false`` first, then inspect whether ``success`` is
 ``true``. This field records RoboDojo's native task verdict; ``finish`` ends
-the planner loop.
+the planner loop. Awomo ``run_policy`` reports confirmed ``executed_steps``,
+``observation_step``, ``pending_actions`` and ``stop_reason`` in ``states.json``. A completed call
+or ended episode is not a native success verdict; agent assessments are separate.
 
 Without ``--output-dir``, results go to
 ``logs/<timestamp>_robodojo_<task>_s<seed>_l<layout>/``. Use different directories for
@@ -289,9 +439,10 @@ concurrent runs. For live monitoring, see :doc:`../guides/dashboard`.
 Common Options
 --------------
 
-RPent starts the simulator, SAM3 and VPP2 services in the current Python environment
-by default. Specify ``--sim-python`` when the simulator uses a separate
-environment.
+The default VPP2 backend starts the simulator, SAM3 and VPP2 locally. Awomo
+starts the simulator and connects to its policy service; SAM3 is added only
+when the agent selects it. ``--sim-python`` selects the simulator interpreter;
+``--policy-python`` selects the Awomo bridge interpreter, not the model process.
 
 Use ``--task`` to select a task. For a fixed scene, ``--seed`` selects an
 official layout group and ``--layout`` selects a layout within that group;
@@ -302,11 +453,16 @@ in this mode.
 
 - ``--cuda-device`` selects the GPU for locally started services. If omitted,
   services inherit ``CUDA_VISIBLE_DEVICES``.
-- ``--vla-backend`` selects the action model; currently ``vpp2`` is supported.
-- ``--vla-model-path`` overrides ``VPP2_MODEL_PATH`` and points to the resource
+- ``--vla-backend`` accepts ``vpp2`` (default) or ``awomo05``.
+- ``--vla-model-path`` applies to VPP2, overrides ``VPP2_MODEL_PATH`` and points to the resource
   root containing ``policy/`` and ``checkpoints/``.
 - ``--env-endpoint``, ``--sam3-endpoint`` and ``--vla-endpoint`` connect to
-  existing services. The VLA endpoint must serve this adapter's VPP2 protocol.
+  existing RPent RPC services. The VLA protocol must match the selected backend.
+- ``--policy-server-url`` is an Awomo ``ws://`` or ``wss://`` upstream URL and
+  cannot be combined with ``--vla-endpoint``. ``--xpolicylab-root`` supplies the
+  transport checkout for a locally started bridge.
+- ``--vla-agent`` enables Awomo collaboration; ``--agent-tools`` selects
+  ``policy``, ``motion``, ``geometry`` or ``sam3`` tool groups.
 - ``--source-root`` selects a local RoboDojo checkout instead of the packaged code.
 
 Child services inherit the current shell environment. The CLI does not load
@@ -316,7 +472,13 @@ for the full option list.
 Tools
 -----
 
-The planner cannot reset an episode; exploration and Flash replay are unavailable.
+Use ``move_to`` for an absolute pose, ``move_delta`` for a relative pose, and
+``hold`` to advance actions with unchanged controller targets. ``rotate_wrist``,
+``set_gripper`` and ``release`` control orientation and gripper opening;
+``vpp2_act`` executes a VPP2 subtask. Awomo exposes ``run_policy(max_steps)``
+on the official instruction; motion and perception tools require the matching
+``--vla-agent`` groups. The planner cannot reset an episode; exploration and
+Flash replay are unavailable.
 
 ``completed`` indicates completion of the tool request, not task success.
 Check ``stop_reason`` for early stops; ``executed_actions`` and
@@ -399,43 +561,10 @@ actions while retaining both arms' and grippers' control targets. Simulation
 continues; measured poses and objects need not stay still. Episode
 termination, the action budget or cancellation can stop execution early.
 
-Awomo05 and agent collaboration
+.. _robodojo-awomo-collaboration:
+
+Awomo05 and Agent Collaboration
 -------------------------------
-
-Select ``--vla-backend awomo05`` to use the official Awomo05 joint policy.
-The default remains ``vpp2``. Awomo uses its own weights in a separately managed
-model process; it does not load or check ``VPP2_MODEL_PATH`` or ``--vla-model-path``.
-Use the official XPolicyLab Awomo05 environment, checkpoint, normalization
-statistics, FLUX.2 base/autoencoder and Qwen3-VL weights. Preserve its BGR input
-configuration, 25 Hz history, native joint layout and official task instruction.
-No RPent-side image transform or action-vector reordering is applied.
-
-Start the metadata-enabled model wrapper in the Awomo environment, with the
-XPolicyLab checkout and its parent on ``PYTHONPATH``::
-
-   python /path/to/RPent/robots/robodojo/awomo05_policy_server.py \
-     --config_path /path/to/XPolicyLab/policy/Awomo05/deploy.yml \
-     --host 127.0.0.1 --port 9005 --overrides \
-     policy_name=Awomo05 bench_name=RoboDojo task_name=general_pickup \
-     env_cfg_type=arx_x5 action_type=joint seed=0 ckpt=model.pt \
-     input_color_order=bgr replan_steps=8
-
-Choose one connection mode:
-
-- ``--policy-server-url ws://127.0.0.1:9005`` borrows the upstream model and starts
-  an RPent bridge. Set ``--xpolicylab-root`` and ``--policy-python`` to the bridge
-  environment (RPC and XPolicyLab WebSocket dependencies; no model weights needed).
-- ``--vla-endpoint http://host:port`` or ``socket://host:port`` borrows an RPent RPC
-  service implementing the Awomo session and metadata contract. It is not an
-  upstream WebSocket URL. The two endpoint options are mutually exclusive.
-
-For example::
-
-   rpent --robot robodojo --planner api --model openai-chat:MODEL \
-     --task general_pickup --vla-backend awomo05 \
-     --policy-server-url ws://127.0.0.1:9005 \
-     --xpolicylab-root /path/to/XPolicyLab --policy-python /path/to/bridge/bin/python \
-     --vla-agent --agent-tools policy motion geometry
 
 Without ``--vla-agent``, the toolkit exposes ``run_policy(max_steps)`` and
 observation/finish tools. With it, the existing planner and toolkit dispatch
@@ -457,28 +586,55 @@ history frame. After progress, resume instead replans from the latest confirmed
 observation. Primitive takeover still discards the cache. Uncertain inference,
 execution or observation delivery blocks further control until an explicit
 reset; resuming alone does not recover it.
-Normal startup selects Env and Awomo; agent mode adds SAM3 only when requested.
-Dashboard component selection uses the same backend starter and connector.
 
-RPent stops bridges it started and releases session ownership at task close.
-Borrowed RPC/model services remain running; their operator owns shutdown. Startup
-failure closes pending RPC sessions and stops already started components.
+.. _robodojo-awomo-troubleshooting:
 
-Bounded verification
+Awomo Startup and Recovery
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use the model terminal for weight and inference errors, ``awomo05_bridge.log``
+for WebSocket or metadata failures, and ``robodojo_env_server.log`` for scene
+startup failures. Check these conditions before rerunning:
+
+- Missing weights or import errors: check the official installation guide,
+  ``AWOMO05_WEIGHTS``, the three base-weight paths, ``dataset_stats.json`` and
+  both entries in ``PYTHONPATH``. Run the model in its own environment.
+- Missing ``get_model_meta`` or incompatible metadata: start the RPent model
+  wrapper and use ``arx_x5``, absolute ``joint`` actions, BGR input and 25 Hz
+  history. A generic VPP2 or legacy policy endpoint is not an Awomo endpoint.
+- Connection refused: wait for the model's listener message, verify host/port
+  reachability from the bridge, and distinguish WebSocket from RPent RPC URLs.
+  A listening socket alone does not validate model compatibility or inference.
+- ``All scene Unstable Error`` during reset: check the existing
+  ``ROBODOJO_PLACEMENT_SETTLE_STEPS=1000`` setting and scene resources.
+- Uncertain inference or execution: do not retry a mutation or resume stale
+  actions. Explicitly reset the environment, or start a new episode when the
+  session offers no reset operation. Known cancellation follows the resume
+  rules above and does not reset model history.
+
+Bounded Verification
 ~~~~~~~~~~~~~~~~~~~~
 
-With dedicated GPUs, simulator assets and the real model endpoint configured::
+Use the prepared RPent simulation environment with XPolicyLab transport
+dependencies and the model service already running. The tests launch their
+bridge with the test interpreter. Reserve simulator GPUs via
+``CUDA_VISIBLE_DEVICES`` and retain the asset, RLinf and settling variables
+from the first run:
 
+.. code-block:: bash
+
+   uv pip install -e ".[test]"
    RPENT_RUN_AWOMO05_INTEGRATION=1 \
    RPENT_AWOMO05_POLICY_SERVER_URL=ws://127.0.0.1:9005 \
-   RPENT_XPOLICYLAB_ROOT=/path/to/XPolicyLab \
+   RPENT_XPOLICYLAB_ROOT=/path/to/RoboDojo/XPolicyLab \
    RPENT_E2E_OUTPUT_DIR=/path/to/new-output \
      pytest tests/e2e_tests/robodojo/test_awomo_bounded.py -v -s
 
 The component test checks real inference, chunk continuation, primitive takeover
 and reset. The public CLI test uses a local scripted planner for
 policy → primitive → policy → finish, checking images, trace, action counts and
-cleanup. These checks are integration evidence, not task-success benchmarks.
+cleanup. Report native success separately: a passing integration check does
+not establish task success or a benchmark success rate.
 
 .. _robodojo-local-nvidia-assets:
 
