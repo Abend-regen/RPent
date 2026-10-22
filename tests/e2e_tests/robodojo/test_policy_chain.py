@@ -32,6 +32,10 @@ pytestmark = [
 @pytest.mark.parametrize(
     "action",
     [
+        ScriptedToolCall("hold", {"steps": 2}),
+        ScriptedToolCall(
+            "move_delta", {"arm": "left", "dxyz": [0, 0, 0.01], "substeps": 8}
+        ),
         ScriptedToolCall("set_gripper", {"arm": "left", "val": 0.5, "steps": 2}),
         ScriptedToolCall(
             "vpp2_act",

@@ -30,7 +30,15 @@ OBSERVATION_TOOLS = frozenset(
     {"view_env_state", "segment", "back_project", "sample_world_xyz", "query_world_map"}
 )
 MOTION_TOOLS = frozenset(
-    {"move_to", "rotate_wrist", "set_gripper", "release", "vpp2_act"}
+    {
+        "move_to",
+        "move_delta",
+        "hold",
+        "rotate_wrist",
+        "set_gripper",
+        "release",
+        "vpp2_act",
+    }
 )
 
 if TYPE_CHECKING:
@@ -73,6 +81,10 @@ class RoboDojoToolkit(Toolkit):
 
     def execute_tool(self, name, input_dict):
         result = super().execute_tool(name, input_dict)
+        if name == "finish" and result.data.get("_finish"):
+            end = getattr(self._primitives.env, "end_execution", None)
+            if end is not None:
+                end()
         if not self.eval_fair and name in {
             "segment",
             "back_project",
@@ -168,3 +180,24 @@ class RoboDojoToolkit(Toolkit):
         )
         self._pending_perception = []
         return robodojo_tools.view_env_state(record.step_idx, state=self._state)
+
+    def close(self) -> None:
+        """Drain tools; the runtime owns the environment across planner sessions."""
+        try:
+            super().close()
+        finally:
+            end = getattr(self._primitives.env, "end_execution", None)
+            if end is not None:
+                end()
+
+    def cancel_active_and_wait(self) -> None:
+        super().cancel_active_and_wait()
+        pause = getattr(self._primitives.env, "pause_execution", None)
+        if pause is not None:
+            pause()
+
+    def resume_calls(self) -> None:
+        resume = getattr(self._primitives.env, "resume_execution", None)
+        if resume is not None:
+            resume()
+        super().resume_calls()

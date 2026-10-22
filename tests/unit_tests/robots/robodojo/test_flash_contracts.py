@@ -312,7 +312,14 @@ def test_eval_facade_never_queries_privileged_feedback(
         assert method not in facade._rpc
     obs, reward, done, info = facade.step({})
     assert reward == 0 and done is False
-    assert info == {"status": {"step": 1, "step_limit": 2}, "executed_actions": 1}
+    assert info == {
+        "status": {"step": 1, "step_limit": 2},
+        "executed_actions": 1,
+        "step_before": 0,
+        "step_after": 1,
+        "terminated": False,
+        "truncated": False,
+    }
     assert obs == public_observation(obs)
     assert "object_world_xyz" not in obs["state"]
     assert "object_id" not in obs["vision"]["cam_head"]

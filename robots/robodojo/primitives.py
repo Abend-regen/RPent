@@ -23,6 +23,7 @@ from typing import Annotated, Literal
 import numpy as np
 from pydantic import Field
 
+from robots.robodojo.execution import ActionRejected, ExecutionSyncError
 from rpent.tools import ToolResult, tool
 from rpent.tools.toolkit import ToolCancelled
 
@@ -76,11 +77,17 @@ class RoboDojoPrimitives:
             if key in status
         }
 
-    def _execute(self, updates: list[dict], *, policy_actions: bool = False) -> dict:
+    def _execute(
+        self, updates: list[dict], *, hold=False, policy_actions=False
+    ) -> dict:
         executed = 0
         status = self._public_status(self.env.get_status())
+        before = status["step"]
         reason = None
         error = None
+        uncertain = False
+        terminated = False
+        truncated = status["step"] >= status["step_limit"]
         for update in updates:
             if status.get("success") is True:
                 reason = "native_success"
@@ -92,28 +99,53 @@ class RoboDojoPrimitives:
                 self._check_cancelled()
                 if policy_actions:
                     _, _, _, info = self.env.step(update)
-                    result = {
-                        "executed_actions": info["executed_actions"],
-                        "episode_status": info["status"],
-                    }
+                    result = {**info, "episode_status": info["status"]}
+                elif hold:
+                    result = self.env.hold_step()
                 else:
                     result = self.env.step_joint_update(**update)
             except ToolCancelled:
                 reason = "cancelled"
+                pause = getattr(self.env, "pause_execution", None)
+                if pause is not None:
+                    try:
+                        pause()
+                    except ExecutionSyncError as exc:
+                        reason, error = "synchronization_lost", str(exc)
+                break
+            except ActionRejected as exc:
+                reason, error = "rejected", str(exc)
+                break
+            except ExecutionSyncError as exc:
+                if exc.feedback is not None:
+                    executed += exc.feedback["executed_actions"]
+                    status = self._public_status(exc.feedback["episode_status"])
+                    terminated = exc.feedback["terminated"]
+                    truncated = exc.feedback["truncated"]
+                reason, error = "synchronization_lost", str(exc)
+                uncertain = exc.execution_uncertain
                 break
             except Exception as exc:
                 # A timed-out mutation may have executed remotely. Do not retry
                 # it or claim that only the acknowledged actions took place.
                 reason = "execution_unknown"
                 error = str(exc)
+                uncertain = True
                 break
             count = int(result["executed_actions"])
             executed += count
             status = self._public_status(result["episode_status"])
+            terminated = result.get("terminated", status.get("success") is True)
+            truncated = result.get("truncated", status["step"] >= status["step_limit"])
+            if terminated or truncated:
+                reason = "episode_end" if terminated else "budget_exhausted"
+                break
             if count != 1:
                 reason = "runtime_failure"
                 break
-        completed = executed == len(updates) and reason is None
+        completed = (
+            executed == len(updates) and error is None and reason != "runtime_failure"
+        )
         if reason is None:
             reason = (
                 "native_success"
@@ -131,7 +163,11 @@ class RoboDojoPrimitives:
             "executed_actions": executed,
             "stop_reason": reason,
             "episode_status": status,
-            **({"error": error, "execution_uncertain": True} if error else {}),
+            "step_before": before,
+            "step_after": status["step"],
+            "terminated": terminated or status.get("success") is True,
+            "truncated": truncated,
+            **({"error": error, "execution_uncertain": uncertain} if error else {}),
             **({"interrupted": True} if reason == "cancelled" else {}),
         }
 
@@ -333,3 +369,83 @@ class RoboDojoPrimitives:
                 "episode_status": native,
             }
         )
+
+    @tool
+    def move_delta(
+        self,
+        *,
+        arm: Literal["left", "right"],
+        dxyz: Annotated[list[float], Field(min_length=3, max_length=3)] = [
+            0.0,
+            0.0,
+            0.0,
+        ],
+        axis: Annotated[list[float], Field(min_length=3, max_length=3)] = [
+            0.0,
+            0.0,
+            1.0,
+        ],
+        angle_deg: float = 0.0,
+        frame: Literal["world", "tool"] = "world",
+        gripper: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)] | None = None,
+        substeps: Annotated[int, Field(ge=0)] = 25,
+    ) -> ToolResult:
+        """Plan a relative EEF target: metres and degrees about an arbitrary axis through the EEF origin. world/tool selects the fixed world or initial tool frame for both translation and rotation. substeps samples the planned path (0: full, 1: endpoint); it is not a time or action budget. No straight-line or multi-turn trajectory guarantee. Zero motion without a gripper target executes no action."""
+        delta, vector = np.asarray(dxyz, dtype=float), np.asarray(axis, dtype=float)
+        if arm not in ("left", "right") or frame not in ("world", "tool"):
+            raise ValueError("invalid arm or frame")
+        if (
+            delta.shape != (3,)
+            or vector.shape != (3,)
+            or not np.isfinite(delta).all()
+            or not np.isfinite(vector).all()
+            or not np.isfinite(angle_deg)
+        ):
+            raise ValueError("dxyz/axis must be finite 3-vectors and angle_deg finite")
+        if type(substeps) is not int or substeps < 0:
+            raise ValueError("substeps must be a nonnegative integer")
+        if gripper is not None and (not np.isfinite(gripper) or not 0 <= gripper <= 1):
+            raise ValueError("gripper must be finite and in [0,1]")
+        # Scale first to avoid overflow when normalizing a finite arbitrary axis.
+        scale = np.max(np.abs(vector))
+        if angle_deg != 0 and scale == 0:
+            raise ValueError("nonzero rotation requires a nonzero axis")
+        self._check_cancelled()
+        if not np.any(delta) and angle_deg == 0 and gripper is None:
+            result = self._execute([])
+            result["stop_reason"] = "no_op"
+            return ToolResult(data=result)
+        pose = np.asarray(self.env.get_motion_state()[f"{arm}_eef_pose"], dtype=float)
+        if (
+            pose.shape != (7,)
+            or not np.isfinite(pose).all()
+            or np.linalg.norm(pose[3:]) == 0
+        ):
+            raise ValueError("invalid measured EEF pose")
+        quat = pose[3:] / np.linalg.norm(pose[3:])
+        rotation = np.array([1.0, 0.0, 0.0, 0.0])
+        if angle_deg != 0:
+            unit = vector / scale
+            unit /= np.linalg.norm(unit)
+            half = np.deg2rad(angle_deg) / 2
+            rotation = np.r_[np.cos(half), np.sin(half) * unit]
+        if frame == "tool":
+            delta = _qmult(_qmult(quat, np.r_[0.0, delta]), quat * [1, -1, -1, -1])[1:]
+            target_quat = _qmult(quat, rotation)
+        else:
+            target_quat = _qmult(rotation, quat)
+        result = self.move_to(
+            arm=arm,
+            xyz=(pose[:3] + delta).tolist(),
+            quat=target_quat.tolist(),
+            gripper=gripper,
+            substeps=substeps,
+        )
+        return result
+
+    @tool
+    def hold(self, *, steps: Annotated[int, Field(ge=1)]) -> ToolResult:
+        """Advance steps native actions, retaining both arms' and grippers' controller targets. Simulation continues; measured poses and objects need not stay still. Episode budget and cancellation can stop execution early."""
+        if type(steps) is not int or steps < 1:
+            raise ValueError("steps must be a positive integer")
+        return ToolResult(data=self._execute([{}] * steps, hold=True))

@@ -17,10 +17,17 @@
 from __future__ import annotations
 
 from collections import deque
+from threading import RLock
 from typing import Any
 
 import numpy as np
 
+from robots.robodojo.execution import (
+    ActionRejected,
+    ExecutionObserver,
+    ExecutionSyncError,
+    validate_receipt,
+)
 from rpent.robots.components.env_client_base import BaseEnvClient
 
 
@@ -35,6 +42,8 @@ class RoboDojoEnvClient(BaseEnvClient):
     """
 
     def __init__(self, client, *, expected_meta: dict[str, Any]):
+        self._execution = None
+        self._execution_lock = RLock()
         self.eval_fair = expected_meta.get("mode") == "eval-fair"
         self._rgb_history = deque(maxlen=177)
         self._history_valid = False
@@ -60,29 +69,50 @@ class RoboDojoEnvClient(BaseEnvClient):
         self._rgb_history.append((self._history_step, frame))
 
     def reset(self):
-        """Clear episode history before a potentially failing reset RPC."""
-        self._history_valid = False
-        self._rgb_history.clear()
-        self._rgb_anchor = None
-        self._inference_index = 0
-        obs = super().reset()
-        self._record_policy_frame(obs)
-        self._history_valid = True
-        return obs
+        """Explicit recovery: reset the environment, then deliver a new episode."""
+        with self._execution_lock:
+            monitor = self._execution
+            if monitor is not None:
+                if monitor.closed or monitor.delivering:
+                    raise RuntimeError(
+                        "cannot reset a closed or re-entered execution boundary"
+                    )
+                monitor.trusted = False
+            self._history_valid = False
+            self._rgb_history.clear()
+            self._rgb_anchor = None
+            self._inference_index = 0
+            if monitor is not None:
+                monitor.paused = False
+                monitor.notify("actions_invalidated", reason="reset")
+            try:
+                obs = super().reset()
+            except Exception as exc:
+                if monitor is not None:
+                    raise monitor.lost(
+                        f"reset RPC failed: {exc}", execution_uncertain=True
+                    ) from exc
+                raise
+            if monitor is not None:
+                self._initialize_execution(reset=True, observation=obs)
+            self._record_policy_frame(obs)
+            self._history_valid = True
+            return obs
 
     def _accept_feedback(self, obs: dict, count: int, was_valid: bool) -> None:
-        if count not in (0, 1):
-            raise ValueError("one action RPC must report zero or one executed action")
         if was_valid and count:
             self._record_policy_frame(obs)
         self._history_valid = was_valid
         self.last_obs = obs
 
     def step(self, flat_action):
-        was_valid, self._history_valid = self._history_valid, False
-        result = super().step(flat_action)
-        self._accept_feedback(result[0], result[3]["executed_actions"], was_valid)
-        return result
+        """Execute an external action; invalidate policy actions before takeover."""
+        return self._call_action(
+            "env.step",
+            kwargs={"flat_action": flat_action},
+            source="external",
+            tuple_result=True,
+        )
 
     def policy_observation(self) -> dict:
         """Reserve one inference index and sample anchor + stride-25 RGB history.
@@ -90,7 +120,9 @@ class RoboDojoEnvClient(BaseEnvClient):
         Read-only observation refreshes do not advance this action timeline.
         Uncertain mutations invalidate it until an actual episode reset.
         """
-        if not self._history_valid:
+        if not self._history_valid or (
+            self._execution is not None and not self._execution.trusted
+        ):
             raise RuntimeError(
                 "VPP2 history unavailable; reset the episode before inference"
             )
@@ -137,16 +169,11 @@ class RoboDojoEnvClient(BaseEnvClient):
         arm_qpos: list[float] | None = None,
         gripper: float | None = None,
     ) -> dict[str, Any]:
-        was_valid, self._history_valid = self._history_valid, False
-        result = self._client.call(
+        return self._call_action(
             "env.step_joint_update",
             kwargs={"arm": arm, "arm_qpos": arm_qpos, "gripper": gripper},
-            timeout_s=60,
+            source="primitive",
         )
-        count = result["executed_actions"]
-        obs = result.pop("observation") if count else self.last_obs
-        self._accept_feedback(obs, count, was_valid)
-        return result
 
     def get_reward_details(self) -> dict[str, Any]:
         return self._client.call("env.get_reward_details")
@@ -164,6 +191,160 @@ class RoboDojoEnvClient(BaseEnvClient):
 
     def close(self) -> None:
         try:
-            self._client.call("env.close", timeout_s=10)
-        except Exception:  # noqa: BLE001
-            pass
+            self.end_execution()
+        finally:
+            try:
+                self._client.call("env.close", timeout_s=10)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def register_execution_observer(self, callback) -> None:
+        """Attach one synchronous adapter; no model or environment reset is implied."""
+        with self._execution_lock:
+            if self._execution is not None:
+                raise RuntimeError("an execution observer is already registered")
+            self._execution = ExecutionObserver(callback)
+            self._initialize_execution(reset=False)
+
+    def _initialize_execution(self, *, reset, observation=None):
+        monitor = self._execution
+        try:
+            before = self.get_status()
+            obs = self.get_obs() if observation is None else observation
+            after = self.get_status()
+            if before["step"] != after["step"]:
+                raise RuntimeError("environment advanced while capturing initial state")
+            self.last_obs = obs
+            monitor.initialize(obs, after, reset=reset)
+        except ExecutionSyncError:
+            raise
+        except Exception as exc:
+            raise monitor.lost(f"initial feedback unavailable: {exc}") from exc
+
+    def require_policy_ready(self) -> None:
+        """Adapters must call this before inference and use step_policy for actions."""
+        with self._execution_lock:
+            monitor = self._execution
+            if monitor is None:
+                raise RuntimeError(
+                    "register an execution observer before policy inference"
+                )
+            if (
+                monitor.delivering
+                or monitor.closed
+                or monitor.paused
+                or not monitor.trusted
+            ):
+                monitor.require_ready({}, None)
+            try:
+                status = self.get_status()
+                instruction = self.get_task_language()
+            except Exception as exc:
+                raise monitor.lost(f"execution context unavailable: {exc}") from exc
+            monitor.require_ready(status, instruction)
+
+    def pause_execution(self) -> None:
+        with self._execution_lock:
+            if self._execution is not None:
+                if self._execution.delivering:
+                    raise RuntimeError("execution callbacks cannot re-enter control")
+                self._execution.paused = True
+                self._execution.notify("actions_invalidated", reason="cancelled")
+
+    def resume_execution(self) -> None:
+        with self._execution_lock:
+            if self._execution is not None:
+                if self._execution.delivering:
+                    raise RuntimeError("execution callbacks cannot re-enter control")
+                self._execution.paused = False
+
+    def end_execution(self) -> None:
+        with self._execution_lock:
+            if self._execution is not None:
+                if self._execution.delivering:
+                    raise RuntimeError("execution callbacks cannot re-enter control")
+                if self._execution.closed:
+                    return
+                self._execution.closed = True
+                self._execution.notify("actions_invalidated", reason="closed")
+                self._execution.notify("closed")
+
+    def _call_action(self, method, *, kwargs, source, tuple_result=False):
+        with self._execution_lock:
+            monitor = self._execution
+            if monitor is not None:
+                self.require_policy_ready()
+                if source != "policy":
+                    monitor.notify("actions_invalidated", reason=source)
+                kwargs = {**kwargs, "expected_step": monitor.step}
+            was_valid, self._history_valid = self._history_valid, False
+            try:
+                result = self._client.call(method, kwargs=kwargs, timeout_s=60)
+                if tuple_result:
+                    obs, _, _, info = result
+                    feedback = {
+                        **info,
+                        "episode_status": info["status"],
+                        "observation": obs,
+                    }
+                else:
+                    feedback = dict(result)
+                    obs = feedback.get("observation")
+                if monitor is not None:
+                    # Validate the complete receipt before publishing to an adapter.
+                    monitor.accept({**feedback, "source": source})
+                else:
+                    validate_receipt(
+                        feedback, self._history_step if was_valid else None
+                    )
+                count = feedback["executed_actions"]
+                if count and obs is None:
+                    raise KeyError("observation")
+                self._accept_feedback(obs if count else self.last_obs, count, was_valid)
+            except ExecutionSyncError as exc:
+                if exc.feedback is not None and isinstance(
+                    exc.feedback.get("observation"), dict
+                ):
+                    self._accept_feedback(
+                        exc.feedback["observation"],
+                        exc.feedback["executed_actions"],
+                        was_valid,
+                    )
+                    self._history_valid = False
+                raise
+            except Exception as exc:
+                if monitor is not None:
+                    raise monitor.lost(
+                        f"action RPC/receipt failed: {exc}", execution_uncertain=True
+                    ) from exc
+                raise
+            if feedback["executed_actions"] and obs is not None:
+                self.last_obs = obs
+            if feedback.get("rejection"):
+                raise ActionRejected(feedback["rejection"])
+            if tuple_result:
+                return result
+            # Large observations travel in the observer event, not tool-result text.
+            result.pop("observation", None)
+            return result
+
+    def step_policy(self, flat_action):
+        """Execute one caller-owned policy action without discarding its remainder."""
+        if self._execution is None:
+            raise RuntimeError("register an execution observer before policy actions")
+        return self._call_action(
+            "env.step",
+            kwargs={"flat_action": flat_action},
+            source="policy",
+            tuple_result=True,
+        )
+
+    def chunk_step(self, flat_actions, *, return_all_frames=False):
+        """RoboDojo requires acknowledged single actions; batches are unsupported."""
+        raise NotImplementedError(
+            "RoboDojo chunk_step is disabled; use acknowledged single-action calls"
+        )
+
+    def hold_step(self):
+        """Advance one native action while retaining both arms' controller targets."""
+        return self._call_action("env.hold_step", kwargs={}, source="hold")

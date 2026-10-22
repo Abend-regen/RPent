@@ -62,6 +62,7 @@ class EnvRPC:
         if method == "env.reset":
             self.step = 0
             return observation(0)
+        before = self.step
         self.step += self.count
         self.actions.append((method, args, kwargs))
         obs = observation(self.step)
@@ -70,10 +71,17 @@ class EnvRPC:
                 obs,
                 0.0,
                 self.success,
-                {"executed_actions": self.count, "status": self.status()},
+                {
+                    "executed_actions": self.count,
+                    "status": self.status(),
+                    "step_before": before,
+                    "step_after": self.step,
+                },
             )
         if method == "env.step_joint_update":
             return {
+                "step_before": before,
+                "step_after": self.step,
                 "observation": obs,
                 "executed_actions": self.count,
                 "episode_status": self.status(),

@@ -366,6 +366,27 @@ defaults to 1. Intermediate values are normalized opening targets rather than
 physical widths. Feedback comes from measured joints. Other controller targets
 are retained while the gripper moves.
 
+Relative motion and execution feedback
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``move_delta(arm, dxyz, axis=[0,0,1], angle_deg=0, frame="world", substeps=25)``
+plans a relative end-effector target. Translation is in metres and rotation
+in degrees about an axis through the end effector. ``frame="tool"`` uses the
+initial tool frame for both. This specifies a target, not a straight-line or
+multi-turn trajectory. Zero displacement without a gripper target is a no-op.
+
+``hold(steps)`` advances native actions while retaining both arms' and grippers'
+controller targets; the simulation and objects continue moving. Both tools use
+the existing action trace and VPP2 history path. Every confirmed action adds one
+history frame; observation reads do not. Results report requested/executed action
+counts, native step counters, termination and truncation.
+
+A synchronous execution observer can consume acknowledged observations. Primitive
+control invalidates pending policy actions before takeover. Cancellation pauses
+execution; resume does not repair uncertain feedback. A successful environment
+reset clears the pause and restores synchronization and VPP2 history. A lost
+reply or failed observer delivery requires reset before policy inference.
+
 .. _robodojo-local-nvidia-assets:
 
 Prepare Local NVIDIA Scene Assets (Optional)

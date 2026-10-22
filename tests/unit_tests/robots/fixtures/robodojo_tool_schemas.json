@@ -378,5 +378,78 @@
       "properties": {},
       "type": "object"
     }
+  },
+  "move_delta": {
+    "name": "move_delta",
+    "description": "Plan a relative EEF target: metres and degrees about an arbitrary axis through the EEF origin. world/tool selects the fixed world or initial tool frame for both translation and rotation. substeps samples the planned path (0: full, 1: endpoint); it is not a time or action budget. No straight-line or multi-turn trajectory guarantee. Zero motion without a gripper target executes no action.",
+    "input_schema": {
+      "properties": {
+        "arm": {
+          "enum": [
+            "left",
+            "right"
+          ],
+          "type": "string"
+        },
+        "dxyz": {
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        },
+        "axis": {
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        },
+        "angle_deg": {
+          "type": "number"
+        },
+        "frame": {
+          "enum": [
+            "world",
+            "tool"
+          ],
+          "type": "string"
+        },
+        "gripper": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "substeps": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "arm"
+      ],
+      "type": "object"
+    }
+  },
+  "hold": {
+    "name": "hold",
+    "description": "Advance steps native actions, retaining both arms' and grippers' controller targets. Simulation continues; measured poses and objects need not stay still. Episode budget and cancellation can stop execution early.",
+    "input_schema": {
+      "properties": {
+        "steps": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "steps"
+      ],
+      "type": "object"
+    }
   }
 }

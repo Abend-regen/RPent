@@ -92,6 +92,8 @@ ROBODOJO_DASHBOARD_SPEC: DashboardSpec = {
         "sample_world_xyz",
         "query_world_map",
         "move_to",
+        "move_delta",
+        "hold",
         "rotate_wrist",
         "set_gripper",
         "release",
