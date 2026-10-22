@@ -18,6 +18,7 @@ import pytest
 
 from robots.robodojo.policy_adapter import RoboDojoPolicyAdapter
 from robots.robodojo.stateful_policy import StatefulPolicyEnv
+from rpent.tools.toolkit import ToolCancelled
 from tests.unit_tests.robots.robodojo import (
     test_stateful_policy_loopback as stateful_tests,
 )
@@ -56,6 +57,85 @@ def test_external_action_discards_remainder_without_resetting_model(live_bridge)
     assert live_bridge.model.inferences == [[0], [0, 1, 2]]
     assert live_bridge.model.resets == 1
     env.close()
+
+
+@pytest.mark.parametrize("cancel_at", [0, 1, 3])
+def test_cancelled_chunk_resumes_without_repeating_inference(live_bridge, cancel_at):
+    native = FakeEnv()
+    model = live_bridge.model
+    cancelled = True
+
+    def check():
+        if cancelled and native.frame == cancel_at and model.inferences:
+            # At 0 and 3, wait for the new chunk's inference to return. At 1,
+            # cancel after one acknowledged action from the first chunk.
+            if cancel_at == 1 or model.inferences[-1][-1] == cancel_at:
+                raise ToolCancelled("cancelled before action")
+
+    env = execution(live_bridge, native, check)
+    try:
+        with pytest.raises(ToolCancelled):
+            env.run(8)
+        assert env.last_run["stop_reason"] == "cancelled"
+        assert env.last_run["executed_steps"] == native.frame == cancel_at
+        assert env.last_run["pending_actions"] == (0 if cancel_at == 1 else 3)
+        assert model.history == list(range(cancel_at + 1))
+        with pytest.raises(RuntimeError, match="resume a pause"):
+            env.run(1)
+        cancelled = False
+        env.resume_execution()
+        result = env.run(4)
+        assert result["executed_steps"] == 4
+        assert result["observation_step"] == native.frame == cancel_at + 4
+        assert model.history == list(range(cancel_at + 5))
+        assert native._history_step == cancel_at + 4
+        assert [step for step, _ in native._rgb_history] == model.history
+        assert [history[-1] for history in model.inferences] == {
+            0: [0, 3],
+            1: [0, 1, 4],
+            3: [0, 3, 6],
+        }[cancel_at]
+        assert model.resets == 1
+    finally:
+        env.close()
+
+
+def test_cancelled_unstarted_chunk_cannot_resume_uncertain_execution(live_bridge):
+    native = FakeEnv()
+    model = live_bridge.model
+    cancelled = True
+
+    def check():
+        if cancelled and model.inferences:
+            raise ToolCancelled("cancelled after inference")
+
+    env = execution(live_bridge, native, check)
+    try:
+        with pytest.raises(ToolCancelled):
+            env.run(2)
+        cancelled = False
+        env.resume_execution()
+
+        def fail():
+            raise RuntimeError("response lost")
+
+        native.after_step = fail
+        with pytest.raises(RuntimeError, match="response lost"):
+            env.run(1)
+        assert native.frame == 1
+        assert env.last_run["executed_steps"] == 0
+        assert not env._pending
+        assert model.history == [0]
+        assert native._history_step == 0
+        native.after_step = lambda: None
+        env.resume_execution()
+        with pytest.raises(RuntimeError, match="unavailable"):
+            env.run(1)
+        assert native.frame == 1
+        assert model.inferences == [[0]]
+        assert model.resets == 1
+    finally:
+        env.close()
 
 
 @pytest.mark.parametrize("change", ["advance", "reset", "instruction", "cancel"])

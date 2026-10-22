@@ -61,6 +61,9 @@ class StatefulPolicyEnv:
 
     All action tools use this boundary so scripted actions also advance model
     history. Read-only environment calls pass through without recording frames.
+    With chunk continuation, cancellation retains a confirmed inference only
+    until its first action executes. Resume reuses it at the same trusted step;
+    after progress, cancellation discards the remainder and permits replanning.
     """
 
     def __init__(
@@ -73,6 +76,7 @@ class StatefulPolicyEnv:
     ) -> None:
         self._resume_chunks = resume_chunks
         self._pending = deque()
+        self._pending_step = None
         self._env = env
         self._policy = policy
         self._check_cancelled = check_cancelled
@@ -109,7 +113,14 @@ class StatefulPolicyEnv:
             self._policy.begin_episode(self._obs)
             self._failed = False
         elif kind == "actions_invalidated":
-            self._discard_actions()
+            # The session has already inferred at this observation. A known,
+            # unstarted chunk can survive a pause without repeating inference
+            # or recording the same observation again. Every other invalidation
+            # (including takeover and synchronization loss) still clears it.
+            if not (
+                event["reason"] == "cancelled" and self._pending_step == self._step
+            ):
+                self._discard_actions()
         elif kind == "action_feedback" and event["executed_actions"]:
             # Advance confirmed progress before delivering to the model. A failed
             # observation RPC cannot erase an acknowledged environment action.
@@ -144,6 +155,7 @@ class StatefulPolicyEnv:
     def _discard_actions(self) -> None:
         # This is the sole cache of returned actions. It never resets the model.
         self._pending.clear()
+        self._pending_step = None
 
     def _check_context(self) -> None:
         if not self._done:
@@ -158,7 +170,7 @@ class StatefulPolicyEnv:
             self._env.invalidate_execution("policy state is uncertain")
 
     def interrupt(self) -> None:
-        """Cancel cached actions without resetting or discarding confirmed history."""
+        """Pause execution, retaining only a confirmed, unstarted action chunk."""
         self._env.pause_execution()
 
     def _require_ready(self) -> None:
@@ -286,7 +298,12 @@ class StatefulPolicyEnv:
                         }
                     )
                     self._pending.extend(actions)
-                self._step_action(self._pending.popleft())
+                    self._pending_step = self._step
+                # Keep the first action available if cancellation is observed
+                # before its RPC. A failed/uncertain RPC invalidates the cache.
+                self._step_action(self._pending[0])
+                if self._pending:  # Terminal feedback may already have cleared it.
+                    self._pending.popleft()
                 executed += 1
         except Exception as exc:
             self.last_run["stop_reason"] = (

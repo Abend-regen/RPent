@@ -26,8 +26,10 @@ class RoboDojoPolicyAdapter:
     In stateful mode a step identifies one observation within the active episode.
     Repeating the latest step does not send it again; callers must associate the
     same control state and instruction with that step. Image contents are not
-    compared. Legacy mode preserves ``predict(obs, options)`` and performs no
-    observation or episode RPCs.
+    compared. The session permits one inference per observation; callers retain
+    a confirmed chunk if cancellation occurs before its first action, rather
+    than predicting again at the same step. Legacy mode preserves
+    ``predict(obs, options)`` and performs no observation or episode RPCs.
     """
 
     def __init__(self, client: Any, *, stateful: bool = False) -> None:
@@ -98,7 +100,7 @@ class RoboDojoPolicyAdapter:
         return self._call(self._client.get_action)
 
     def invalidate_episode(self) -> None:
-        """Prevent further policy use after uncertain control or a discarded inference."""
+        """Prevent further policy use after uncertain control or model state."""
         if self._stateful:
             self._failed = True
 

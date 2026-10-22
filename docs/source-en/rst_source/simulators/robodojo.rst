@@ -449,7 +449,14 @@ and exploration are rejected. API and Codex planners are supported.
 Awomo continues unconsumed chunks across bounded ``run_policy`` calls. Reads do
 not add observations. A primitive discards pending actions but delivers its
 confirmed observation without resetting model history. Cancellation discards
-pending actions; uncertain execution or observation delivery requires reset.
+the remainder of a chunk once it has made progress. If inference returned
+successfully but cancellation occurred before that chunk's first action,
+RPent retains the whole chunk while paused. Resuming at the same valid
+environment state uses those actions without another inference or duplicate
+history frame. After progress, resume instead replans from the latest confirmed
+observation. Primitive takeover still discards the cache. Uncertain inference,
+execution or observation delivery blocks further control until an explicit
+reset; resuming alone does not recover it.
 Normal startup selects Env and Awomo; agent mode adds SAM3 only when requested.
 Dashboard component selection uses the same backend starter and connector.
 
