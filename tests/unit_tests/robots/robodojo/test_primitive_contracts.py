@@ -504,7 +504,7 @@ def test_move_delta_noop_and_explicit_gripper_target(motion):
     env, primitive = motion
     result = primitive.move_delta(arm="left").data
     assert result["executed_actions"] == 0 and result["stop_reason"] == "no_op"
-    assert result["step_before"] == result["step_after"] == 0
+    assert result["episode_status"]["step"] == 0
     assert not env.plans and not env.updates
     primitive.move_delta(arm="left", gripper=0.5, substeps=1)
     assert len(env.updates) == 1 and env.opening["left"] == 0.5

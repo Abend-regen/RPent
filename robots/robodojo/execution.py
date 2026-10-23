@@ -70,7 +70,6 @@ class ExecutionObserver:
         self.paused = False
         self.closed = False
         self.delivering = False
-        self.last_feedback = None
 
     def _emit(self, kind, **payload):
         event = dict(kind=kind, episode=self.episode, step=self.step, **payload)
@@ -105,7 +104,6 @@ class ExecutionObserver:
         self.step = status["step"]
         self.instruction = observation.get("instruction")
         self.ended = False
-        self.last_feedback = None
         self.notify(
             "reset" if reset else "attached", observation=observation, status=status
         )
@@ -143,12 +141,9 @@ class ExecutionObserver:
             )
 
     def accept(self, feedback):
-        try:
-            after, count = validate_receipt(feedback, self.step)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise self.lost(str(exc), execution_uncertain=True) from exc
-        self.step = after
-        self.last_feedback = feedback
+        """Deliver a receipt whose action counts were validated by the client."""
+        self.step = feedback["step_after"]
+        count = feedback["executed_actions"]
         if count and not isinstance(feedback.get("observation"), dict):
             raise self.lost("executed action has no observation", feedback=feedback)
         try:

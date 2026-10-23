@@ -20,11 +20,14 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from robots.robodojo.execution import ExecutionSyncError
 from robots.robodojo.primitives import RoboDojoPrimitives
 from rpent.dashboard.events import DashboardEventSink
 from rpent.session import EnvState
 from rpent.tools import Toolkit, ToolResult, iter_tools, tool
-from rpent.utils.logging import get_output_dir
+from rpent.utils.logging import get_logger, get_output_dir
+
+logger = get_logger(__name__)
 
 OBSERVATION_TOOLS = frozenset(
     {"view_env_state", "segment", "back_project", "sample_world_xyz", "query_world_map"}
@@ -84,7 +87,11 @@ class RoboDojoToolkit(Toolkit):
         if name == "finish" and result.data.get("_finish"):
             end = getattr(self._primitives.env, "end_execution", None)
             if end is not None:
-                end()
+                try:
+                    end()
+                except ExecutionSyncError as exc:
+                    logger.exception("Failed to close execution after finish")
+                    result.data.setdefault("error", str(exc))
         if not self.eval_fair and name in {
             "segment",
             "back_project",
@@ -183,12 +190,21 @@ class RoboDojoToolkit(Toolkit):
 
     def close(self) -> None:
         """Drain tools; the runtime owns the environment across planner sessions."""
+        drained = False
         try:
             super().close()
+            drained = True
         finally:
             end = getattr(self._primitives.env, "end_execution", None)
             if end is not None:
-                end()
+                try:
+                    end()
+                except ExecutionSyncError:
+                    if drained:
+                        raise
+                    logger.exception(
+                        "Failed to close execution after tool cleanup failed"
+                    )
 
     def cancel_active_and_wait(self) -> None:
         super().cancel_active_and_wait()

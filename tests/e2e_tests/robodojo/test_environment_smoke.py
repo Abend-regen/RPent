@@ -132,6 +132,41 @@ def test_environment_primitives(monkeypatch):
             ):
                 np.testing.assert_array_equal(rgb, obs["vision"][camera]["color"])
             assert env._history_step == env.get_status()["step"]
+            native_step = env.get_status()["step"]
+            history_step = env._history_step
+            tool_step = toolkit._state.latest_step
+            executed = 0
+            for name, arguments in [
+                ("move_delta", {"arm": "left", "dxyz": [0, 0, 0.01], "substeps": 8}),
+                ("hold", {"steps": 2}),
+            ]:
+                before = env.get_motion_state()
+                result = toolkit.execute_tool(name, arguments)
+                assert not result.is_error, result.data
+                execution = result.data["log"]["result"]
+                assert execution["completed"] and execution["executed_actions"] > 0, (
+                    execution
+                )
+                executed += execution["executed_actions"]
+                after = env.get_motion_state()
+                if name == "move_delta":
+                    check_pose_transition(
+                        before["left_eef_pose"], after["left_eef_pose"], z_delta=0.01
+                    )
+                else:
+                    for key in before["targets"]:
+                        np.testing.assert_allclose(
+                            after["targets"][key], before["targets"][key], atol=1e-6
+                        )
+            assert env.get_status()["step"] - native_step == executed
+            history = env.policy_observation()
+            env.get_obs()
+            assert env._history_step - history_step == executed
+            np.testing.assert_array_equal(
+                history["history"][-1][0], env.last_obs["vision"]["cam_head"]["color"]
+            )
+            assert toolkit._state.latest_step == tool_step + 2
+            require_rgb(toolkit._state.load("cam_head.png", step=tool_step + 2), "head")
             env.reset()
             reset_input = env.policy_observation()
             assert reset_input["inference_index"] == 0 and env._history_step == 0

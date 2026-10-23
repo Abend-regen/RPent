@@ -82,7 +82,6 @@ class RoboDojoPrimitives:
     ) -> dict:
         executed = 0
         status = self._public_status(self.env.get_status())
-        before = status["step"]
         reason = None
         error = None
         uncertain = False
@@ -163,10 +162,6 @@ class RoboDojoPrimitives:
             "executed_actions": executed,
             "stop_reason": reason,
             "episode_status": status,
-            "step_before": before,
-            "step_after": status["step"],
-            "terminated": terminated or status.get("success") is True,
-            "truncated": truncated,
             **({"error": error, "execution_uncertain": uncertain} if error else {}),
             **({"interrupted": True} if reason == "cancelled" else {}),
         }
@@ -188,7 +183,6 @@ class RoboDojoPrimitives:
         if self.vla_client is None:
             raise RuntimeError("VPP2 is not connected")
         result = self._execute([])
-        step_before = result["step_before"]
         executed = completed_chunks = 0
         for _ in range(chunks):
             if result["stop_reason"] != "completed":
@@ -219,7 +213,6 @@ class RoboDojoPrimitives:
             requested_actions=chunks * REPLAN_STEPS,
             executed_steps=executed,
             executed_actions=executed,
-            step_before=step_before,
             completed=completed_chunks == chunks,
         )
         return ToolResult(data=result)

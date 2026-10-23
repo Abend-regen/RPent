@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from robots.robodojo.env_client import RoboDojoEnvClient
+from robots.robodojo.execution import ExecutionSyncError
 from robots.robodojo.primitives import RoboDojoPrimitives
 from robots.robodojo.vpp2_client import VPP2Client
 from rpent.tools.toolkit import ToolCancelled
@@ -174,7 +175,7 @@ def test_missing_action_observation_invalidates_history(connected, monkeypatch):
         return result
 
     monkeypatch.setattr(rpc, "call", missing)
-    with pytest.raises(KeyError):
+    with pytest.raises(ExecutionSyncError, match="observation"):
         env.step_joint_update("left", gripper=0)
     with pytest.raises(RuntimeError, match="history unavailable"):
         env.policy_observation()
@@ -241,10 +242,6 @@ def test_tool_replans_after_analytic_actions_and_keeps_subtasks_in_one_episode(
     result = primitive.vpp2_act(instruction="pick the red block", chunks=2).data
     assert result["completed"] and result["executed_actions"] == 48
     assert result["executed_chunks"] == 2
-    assert result["step_before"] == 1
-    assert result["step_after"] == result["episode_status"]["step"] == 49
-    assert result["executed_steps"] == 48
-    assert not result["terminated"] and not result["truncated"]
     assert stamps(calls[0])[-1] == 1 and stamps(calls[1])[-1] == 25
     assert [call["inference_index"] for call in calls] == [0, 1]
     primitive.vpp2_act(instruction="put it in the basket")
@@ -257,52 +254,38 @@ def test_tool_replans_after_analytic_actions_and_keeps_subtasks_in_one_episode(
     "terminal", ["budget", "success", "cancelled", "uncertain", "zero"]
 )
 def test_partial_or_terminal_execution_is_reported_without_extra_inference(
-    connected, monkeypatch, terminal
+    connected, terminal
 ):
     rpc, env = connected
     client, calls = policy_client()
-    env.step_joint_update("left", gripper=0.5)
-    original = rpc.call
-
-    def call(method, **kwargs):
-        result = original(method, **kwargs)
-        if terminal == "uncertain" and method == "env.step" and rpc.step == 29:
-            # The action ran remotely, but its receipt never reached the client.
-            raise TimeoutError("lost response")
-        return result
-
-    monkeypatch.setattr(rpc, "call", call)
 
     def check():
-        if terminal == "success" and rpc.step == 27:
-            rpc.success = True
-        if rpc.step == 28:
+        if rpc.step == 4:
             if terminal == "cancelled":
                 raise ToolCancelled("cancelled")
+            if terminal == "uncertain":
+                rpc.failure = TimeoutError("lost response")
             if terminal == "zero":
                 rpc.count = 0
 
     if terminal == "budget":
-        rpc.limit = 28
+        rpc.limit = 4
+    if terminal == "success":
+        rpc.success = True
     primitive = RoboDojoPrimitives(env=env, vla_client=client, check_cancelled=check)
     result = primitive.vpp2_act(instruction="pick the block", chunks=2).data
     assert not result["completed"]
     assert result["requested_actions"] == 48
-    assert result["executed_actions"] == result["executed_steps"] == 27
-    assert result["step_before"] == 1
-    assert result["step_after"] == result["episode_status"]["step"] == 28
-    assert result["terminated"] == (terminal == "success")
-    assert result["truncated"] == (terminal == "budget")
+    assert result["executed_actions"] == (0 if terminal == "success" else 4)
     assert result.get("interrupted", False) == (terminal == "cancelled")
     assert result.get("execution_uncertain", False) == (terminal == "uncertain")
-    assert rpc.step == (29 if terminal == "uncertain" else 28)
-    assert len(calls) == 2
-    assert result["executed_chunks"] == 1
+    assert len(calls) == (0 if terminal == "success" else 1)
+    assert result["executed_chunks"] == 0
     assert (
         result["stop_reason"]
         == {
             "budget": "budget_exhausted",
-            "success": "episode_end",
+            "success": "native_success",
             "cancelled": "cancelled",
             "uncertain": "execution_unknown",
             "zero": "runtime_failure",
@@ -314,27 +297,20 @@ def test_inference_failure_keeps_completed_chunk_counts(connected):
     _, env = connected
     client, _ = policy_client()
     infer = client.infer
-    env.step_joint_update("left", gripper=0.5)
 
-    def fail_third(obs, instruction):
-        if obs["inference_index"] == 2:
+    def fail_second(obs, instruction):
+        if obs["inference_index"] == 1:
             raise TimeoutError("model timeout")
         return infer(obs, instruction)
 
-    client.infer = fail_third
+    client.infer = fail_second
     primitive = RoboDojoPrimitives(
         env=env, vla_client=client, check_cancelled=lambda: None
     )
-    result = primitive.vpp2_act(instruction="pick the block", chunks=3).data
-    assert result["executed_actions"] == result["executed_steps"] == 48
-    assert result["executed_chunks"] == 2 and result["requested_actions"] == 72
-    assert result["step_before"] == 1
-    assert result["step_after"] == result["episode_status"]["step"] == 49
-    assert not result["terminated"] and not result["truncated"]
-    assert not result.get("execution_uncertain", False)
-    assert not result["success"] and result["error"] == "model timeout"
+    result = primitive.vpp2_act(instruction="pick the block", chunks=2).data
+    assert result["executed_actions"] == 24 and result["executed_chunks"] == 1
     assert not result["completed"] and result["stop_reason"] == "inference_failed"
-    assert env.policy_observation()["inference_index"] == 3
+    assert env.policy_observation()["inference_index"] == 2
 
 
 def test_toolkit_registers_policy_and_persists_subtask_without_recipe_export(

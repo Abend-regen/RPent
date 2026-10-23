@@ -194,7 +194,7 @@ def test_uncertainty_latches_and_preserves_confirmed_progress(boundary, fault):
     assert result["executed_actions"] == (
         2 if fault in ("delivery", "missing_obs") else 1
     )
-    assert result["step_after"] == result["executed_actions"]
+    assert result["episode_status"]["step"] == result["executed_actions"]
     assert result["execution_uncertain"] is (fault not in ("delivery", "missing_obs"))
     assert result["stop_reason"] == "synchronization_lost"
     b.env.resume_execution()  # Resume never repairs lost synchronization.
@@ -335,7 +335,7 @@ def test_hold_stops_at_native_budget_or_cancel_with_progress(boundary, stop):
         .data
     )
     assert result["executed_actions"] == 3 and not result["completed"]
-    assert result["step_before"] == 0 and result["step_after"] == 3
+    assert result["episode_status"]["step"] == 3
     assert len(feedback(events)) == 3
     assert (
         result["stop_reason"]
@@ -390,32 +390,28 @@ def test_confirmed_mixed_actions_feed_vpp2_once_and_reads_do_not_advance(boundar
     from tests.unit_tests.robots.robodojo.test_vpp2_contracts import stamps
 
     b = boundary
-    b.native.step_lim = 300
     events = []
     b.env.register_execution_observer(events.append)
     primitive = RoboDojoPrimitives(env=b.env, check_cancelled=lambda: None)
-    for index in range(200):
-        if index % 3 == 0:
+    for index in range(3):
+        if index == 0:
             b.env.step_policy(action())
-        elif index % 3 == 1:
+        elif index == 1:
             primitive.hold(steps=1)
         else:
             b.env.step_joint_update("left", gripper=0.5)
+        assert b.env._history_step == len(feedback(events)) == index + 1
         b.env.get_obs()
         b.env.get_motion_state()
-    assert stamps(b.env.policy_observation()) == [
-        0,
-        25,
-        50,
-        75,
-        100,
-        125,
-        150,
-        175,
-        200,
+        assert b.native.take_action_cnt[0] == b.env._history_step == index + 1
+        assert len(b.env._rgb_history) == index + 2
+        assert stamps(b.env.policy_observation())[-1] == index + 1
+        assert len(feedback(events)) == index + 1
+    assert [(r["step_after"], r["executed_actions"]) for r in feedback(events)] == [
+        (1, 1),
+        (2, 1),
+        (3, 1),
     ]
-    assert len(feedback(events)) == 200
-    assert b.env._history_step == 200
 
 
 @pytest.mark.parametrize("fault", ["timeout", "delivery", "reset_delivery"])

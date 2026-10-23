@@ -248,6 +248,8 @@ class RoboDojoEnvClient(BaseEnvClient):
             if self._execution is not None:
                 if self._execution.delivering:
                     raise RuntimeError("execution callbacks cannot re-enter control")
+                if self._execution.paused or self._execution.closed:
+                    return
                 self._execution.paused = True
                 self._execution.notify("actions_invalidated", reason="cancelled")
 
@@ -266,7 +268,14 @@ class RoboDojoEnvClient(BaseEnvClient):
                 if self._execution.closed:
                     return
                 self._execution.closed = True
-                self._execution.notify("actions_invalidated", reason="closed")
+                try:
+                    self._execution.notify("actions_invalidated", reason="closed")
+                except ExecutionSyncError:
+                    try:
+                        self._execution.notify("closed")
+                    except ExecutionSyncError:
+                        pass  # Preserve the first failure while attempting cleanup.
+                    raise
                 self._execution.notify("closed")
 
     def _call_action(self, method, *, kwargs, source, tuple_result=False):
@@ -278,6 +287,7 @@ class RoboDojoEnvClient(BaseEnvClient):
                     monitor.notify("actions_invalidated", reason=source)
                 kwargs = {**kwargs, "expected_step": monitor.step}
             was_valid, self._history_valid = self._history_valid, False
+            confirmed_feedback = None
             try:
                 result = self._client.call(method, kwargs=kwargs, timeout_s=60)
                 if tuple_result:
@@ -290,36 +300,37 @@ class RoboDojoEnvClient(BaseEnvClient):
                 else:
                     feedback = dict(result)
                     obs = feedback.get("observation")
+                validate_receipt(
+                    feedback,
+                    monitor.step
+                    if monitor is not None
+                    else self._history_step
+                    if was_valid
+                    else None,
+                )
+                # Observation processing or delivery cannot erase confirmed progress.
+                confirmed_feedback = feedback
                 if monitor is not None:
-                    # Validate the complete receipt before publishing to an adapter.
                     monitor.accept({**feedback, "source": source})
-                else:
-                    validate_receipt(
-                        feedback, self._history_step if was_valid else None
-                    )
                 count = feedback["executed_actions"]
                 if count and obs is None:
                     raise KeyError("observation")
                 self._accept_feedback(obs if count else self.last_obs, count, was_valid)
             except ExecutionSyncError as exc:
-                if exc.feedback is not None and isinstance(
-                    exc.feedback.get("observation"), dict
-                ):
-                    self._accept_feedback(
-                        exc.feedback["observation"],
-                        exc.feedback["executed_actions"],
-                        was_valid,
-                    )
-                    self._history_valid = False
+                if confirmed_feedback is not None:
+                    if exc.feedback is None:
+                        exc.feedback = confirmed_feedback
+                    exc.execution_uncertain = False
                 raise
             except Exception as exc:
-                if monitor is not None:
-                    raise monitor.lost(
-                        f"action RPC/receipt failed: {exc}", execution_uncertain=True
+                if monitor is not None or confirmed_feedback is not None:
+                    lost = monitor.lost if monitor is not None else ExecutionSyncError
+                    raise lost(
+                        f"action RPC/receipt failed: {exc}",
+                        feedback=confirmed_feedback,
+                        execution_uncertain=confirmed_feedback is None,
                     ) from exc
                 raise
-            if feedback["executed_actions"] and obs is not None:
-                self.last_obs = obs
             if feedback.get("rejection"):
                 raise ActionRejected(feedback["rejection"])
             if tuple_result:
