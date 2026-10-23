@@ -150,6 +150,24 @@ This checks integration, not autonomous planning quality or benchmark task succe
 RoboDojo is not yet a target of
 `run_gpu_suite.sh`; run these opt-in tests directly with a fresh output directory.
 
+### Awomo component and bounded CLI checks
+
+Use the RoboDojo guide's [Awomo setup and verification commands](../docs/source-en/rst_source/simulators/robodojo.rst#robodojo-awomo-verification)
+([Chinese](../docs/source-zh/rst_source/simulators/robodojo.rst#robodojo-awomo-verification)) to prepare
+the model service and a separate simulator GPU. Run
+`tests/e2e_tests/robodojo/test_awomo_bounded.py` with
+`RPENT_RUN_AWOMO05_INTEGRATION=1`; without this opt-in flag, both cases are skipped.
+The tests leave the externally started model running.
+
+The component case checks real inference, chunk continuation, primitive takeover
+and reset. It requires at least three actions in the returned chunk and skips
+when that prerequisite is absent. The public CLI case uses a scripted local
+planner for policy → primitive → policy → finish, checking registered tool calls,
+images, persisted inference metadata, confirmed action counts and cleanup.
+It does not use an online LLM; passing establishes the integration chain, not
+autonomous planning quality or task success rate. Report native task success
+separately.
+
 ### Supported full suites
 
 The runner must expose one GPU and the checkpoint and simulator assets required

@@ -1,7 +1,7 @@
 RoboDojo
 ========
 
-通过 RPent 在 RoboDojo 中执行双臂桌面操作任务。仿真器基于 Isaac Sim / IsaacLab，采用 ARX-X5 双机械臂平台。策略动作可选择 VPP2（默认）或 Awomo05。VPP2 提供原生动作原语和 SAM3 分割；Awomo 可通过协作模式中的对应工具组使用这些能力。
+通过 RPent 在 RoboDojo 中执行双臂桌面操作任务。仿真器基于 Isaac Sim / IsaacLab，采用 ARX-X5 双机械臂平台。策略动作可选择 VPP2（默认）或 Awomo05。VPP2 模式下可使用原生运动原语和 SAM3 分割；Awomo 混合模式通过对应工具组启用这些能力。
 
 概览
 ----
@@ -61,9 +61,9 @@ RoboDojo
    * - 项目
      - 说明
    * - 观测
-     - 头部和左右腕部相机的 RGB-D 图像、相机标定，以及双臂关节状态、末端执行器位姿和夹爪开合状态。
+     - 头部和左右腕部相机的 RGB-D 图像、相机标定，以及双臂关节状态、末端执行器位姿和夹爪开合状态。深度与标定用于几何查询，Awomo 策略执行本身不要求深度。
    * - 动作
-     - VPP2 提供 ``vpp2_act`` 和原生动作原语（``move_to``、``move_delta``、``rotate_wrist``、``set_gripper``、``release``、``hold``）。Awomo05 提供 ``run_policy``；启用 ``--vla-agent`` 后可添加所选运动和感知工具。``finish`` 不能覆盖原生任务判定。
+     - VPP2 模式下可使用 ``vpp2_act`` 和原生运动原语（``move_to``、``move_delta``、``rotate_wrist``、``set_gripper``、``release``、``hold``）。Awomo05 模式下可使用 ``run_policy``；启用 ``--vla-agent`` 后可添加所选运动和感知工具。``finish`` 不能覆盖原生任务判定。
    * - 奖励与成功判定
      - 任务是否成功由 RoboDojo 原生环境判定，结果记录在 ``result.json`` 的 ``success`` 字段中。
    * - 任务指令
@@ -154,7 +154,7 @@ VLA 配置
 VPP2 配置
 ~~~~~~~~~
 
-VPP2 是默认动作模型，通过 ``--vla-backend vpp2`` 选择。准备官方 `VPP2 RoboDojo 实现 <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_ 和 `Haodong082399/VPP2 <https://huggingface.co/Haodong082399/VPP2>`_ 发布的配对 100k 权重。资源目录可以自行选择；以下以 ``/path/to/vpp2`` 为例，使用时替换为自己的目录：
+准备官方 `VPP2 RoboDojo 实现 <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_ 和 `Haodong082399/VPP2 <https://huggingface.co/Haodong082399/VPP2>`_ 发布的配对 100k 权重。资源目录可以自行选择；以下以 ``/path/to/vpp2`` 为例，使用时替换为自己的目录：
 
 .. code-block:: bash
 
@@ -195,7 +195,7 @@ VPP2 是默认动作模型，通过 ``--vla-backend vpp2`` 选择。准备官方
 Awomo05 配置
 ~~~~~~~~~~~~
 
-环境和资源准备以 `XPolicyLab 官方 Awomo05 指南 <https://github.com/XPolicyLab/XPolicyLab/blob/562c14cf08b9e6e411e7d76f192740afced77160/policy/Awomo05/README.md>`_ 为准。模型使用独立于 Isaac Sim 的环境；官方安装脚本固定 PyTorch 2.8.0、Transformers 5.5.0 和 PEFT 0.5.0。RPent 桥接服务（bridge）只需 RPent 和 XPolicyLab 的 WebSocket 依赖，可以运行在 RPent 仿真环境中，无需在该环境安装 Awomo 模型依赖。
+环境和资源准备以 `XPolicyLab 官方 Awomo05 指南 <https://github.com/XPolicyLab/XPolicyLab/blob/562c14cf08b9e6e411e7d76f192740afced77160/policy/Awomo05/README.md>`_ 为准。模型使用独立于 Isaac Sim 的环境。RPent 桥接服务（bridge）只需 RPent 和 XPolicyLab 的 WebSocket 依赖，可以运行在 RPent 仿真环境中，无需在该环境安装 Awomo 模型依赖。
 
 以下流程由你启动模型，再由 RPent 启动桥接服务。将示例目录替换为本地绝对路径。先准备上游源码中的策略代码和机器人配置；RPent 仍使用前文安装的仿真器：
 
@@ -235,7 +235,7 @@ Awomo05 配置
      env_cfg_type=arx_x5 action_type=joint seed=0 ckpt=model.pt \
      input_color_order=bgr replan_steps=8
 
-等待模型终端依次出现 ``Awomo05 ready`` 和 ``websocket policy server listening``，分别表示模型初始化完成和开始监听；这不代表真实推理已经成功。保持该终端运行。上述入口提供 ``get_model_meta``，供桥接服务校验兼容性。保留 BGR 配置、25 Hz 历史、原生关节布局和官方任务指令；RPent 不重排动作，也不额外变换图像。启动失败时，先按 :ref:`robodojo-awomo-troubleshooting` 排查，再启动 RPent。
+等待模型终端依次出现 ``Awomo05 ready`` 和 ``websocket policy server listening``，分别表示模型初始化完成和开始监听。保持该终端运行。上述入口提供 ``get_model_meta``，供桥接服务校验兼容性。保留 BGR 配置、25 Hz 历史、原生关节布局和官方任务指令；RPent 不重排动作，也不额外变换图像。启动失败时，先按 :ref:`robodojo-awomo-troubleshooting` 排查，再启动 RPent。
 
 SAM3 配置
 ---------
@@ -305,6 +305,8 @@ SAM3 用于物体分割。VPP2 默认启动该服务；Awomo 仅在通过 ``--vl
 
 将 ``<planner-model>`` 替换为已配置的规划器模型名。该命令启动仿真环境和 CPU 桥接服务，连接已运行的 Awomo 模型，不需要 VPP2 或 SAM3 权重。RPent 会等待桥接服务就绪并校验元数据，再开始执行。若启动中断，检查输出目录中的 ``awomo05_bridge.log`` 和 ``robodojo_env_server.log``。规划器可调用 ``run_policy``、读取已保存状态并调用 ``finish``。需要混合控制时，添加 ``--vla-agent --agent-tools policy motion geometry``；工具与规划器限制见 :ref:`robodojo-awomo-collaboration`。
 
+.. _robodojo-existing-rpc:
+
 连接已有 RPC 服务（替代方式）
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -315,9 +317,11 @@ SAM3 用于物体分割。VPP2 默认启动该服务；Awomo 仅在通过 ``--vl
    python -m robots.robodojo.awomo05_bridge --task general_pickup \
      --policy-server-url ws://127.0.0.1:9005 --host 127.0.0.1 --port 9205
 
-在任务命令中，将 ``--policy-server-url``、``--xpolicylab-root`` 和 ``--policy-python`` 替换为 ``--vla-endpoint http://127.0.0.1:9205``。兼容的外部服务也可使用 ``socket://host:port``；上面的桥接命令提供 HTTP 服务。RPC 协议必须与 ``--vla-backend`` 一致：VPP2 使用 VPP2 协议，Awomo 使用会话与元数据契约。这两个端点参数都不表示模型目录。
+在任务命令中，将 ``--policy-server-url``、``--xpolicylab-root`` 和 ``--policy-python`` 替换为 ``--vla-endpoint http://127.0.0.1:9205``。兼容的外部服务也可使用 ``socket://host:port``；上面的桥接命令提供 HTTP 服务。RPC 协议必须与 ``--vla-backend`` 一致：VPP2 使用 VPP2 协议，Awomo 使用会话与元数据契约。
 
-RPent 负责停止自己启动的桥接服务，并在任务关闭时释放会话。借用的 RPC 与模型服务继续运行，由其管理者停止。启动失败时，RPent 会关闭待用 RPC 会话并停止自己已启动的组件。Dashboard 按所选后端使用同一套启动与连接逻辑。
+RPent 在任务结束时释放策略回合，并在运行环境关闭时停止自己启动的桥接服务。连接的模型与 RPC 服务仍由其管理者停止。启动失败时，RPent 关闭待用连接并停止自己已启动的组件。
+
+每个上游模型只使用一个桥接服务，并仅通过该桥接服务执行回合。官方服务在连接间共享模型历史；会话所有权只能阻止同一桥接服务内的并发回合，无法协调多个桥接服务或直连模型的其他客户端。需要并行运行时，为每个桥接服务分别启动模型服务。
 
 查看结果
 --------
@@ -326,15 +330,14 @@ RPent 负责停止自己启动的桥接服务，并在任务关闭时释放会�
 
 - ``result.json``：环境的任务成功判定及运行错误状态。
 - ``states.json``：工具命令、执行结果及同帧观测记录。
-- 各相机逐步保存的 RGB、米制深度、标定和世界坐标三维图。
+- 各相机逐步保存的 RGB；启用几何工具时，还保存可用的米制深度、标定和世界坐标三维图。
 - ``videos/``：头部、左腕和右腕相机的视频。
 - ``robodojo_env_server.log``：仿真启动与错误日志。VPP2 本地启动的 SAM3 和模型服务分别写入 ``sam3_server.log``、``robodojo_vpp2_server.log``。自动启动的 Awomo 桥接服务写入 ``awomo05_bridge.log``；独立模型服务的日志在模型终端中。Awomo 只有启动 SAM3 时才会产生对应日志。
-- Awomo 协作模式下的 ``agent-decisions.json``：阶段计划、工具反馈及规划器后续复查。
 - ``run.log`` 和 ``transcript_*.json``：主进程日志、规划器对话和错误。
 
-先检查 ``environment_result_available=true`` 和\
-``agent_error_present=false``，再看 ``success`` 是否为 ``true``。该字段记录 RoboDojo 的原生任务判定，\
-``finish`` 用于结束规划循环。Awomo 的 ``run_policy`` 回执包含已确认的 ``executed_steps``、``observation_step``、``pending_actions`` 和 ``stop_reason``，完整结果见 ``states.json``。一次调用完成或回合结束不代表环境判定成功；协作代理的判断也单独记录。
+先检查 ``environment_result_available=true`` 和 ``agent_error_present=false``，再看 ``success``。该字段是 RoboDojo 的原生判定；工具调用完成、回合结束或规划器调用 ``finish`` 均不代表任务成功。Awomo 的 ``finish.agent_assessment`` 单独记录规划器自述。
+
+``states.json`` 保存完整 Awomo 执行结果，包括 ``executed_steps``、``pending_actions``、``stop_reason``，以及带有同次推理元信息的 ``inferences``。Planner 返回使用 ``inference_count`` 摘要，不重复携带完整推理列表。``step``／``step_idx`` 选择已保存观测记录，``executed_steps`` 是单次调用确认的动作数，``observation_step`` 相对于当前模型会话计数，三者不能混用。
 
 未指定输出目录时，结果保存在 ``logs/<timestamp>_robodojo_<task>_s<seed>_l<layout>/``。并发运行应使用不同目录。\
 实时查看方式见 :doc:`../guides/dashboard`。
@@ -342,7 +345,7 @@ RPent 负责停止自己启动的桥接服务，并在任务关闭时释放会�
 常用参数
 --------
 
-默认的 VPP2 后端在本地启动仿真、SAM3 和 VPP2。Awomo 启动仿真并连接策略服务，仅在协作模式选择 SAM3 时才添加该组件。``--sim-python`` 指定仿真解释器；``--policy-python`` 指定 Awomo 桥接服务的解释器，不负责启动模型进程。
+CLI 和 Dashboard 使用相同默认值：VPP2 在本地启动仿真、SAM3 和 VPP2；Awomo 启动仿真并连接模型，仅在工具组选择 SAM3 时添加该组件。``--sim-python`` 指定仿真解释器；``--policy-python`` 指定 Awomo 桥接服务的解释器，不负责启动模型进程。
 
 使用 ``--task`` 选择任务。固定场景通过 ``--seed`` 选择官方布局组，通过 ``--layout`` 选择组内布局，两者默认均为 ``0``。例如，``--task stack_blocks --seed 0 --layout 2`` 使用第 0 组的第 2 个布局。需要随机生成场景时，添加 ``--random``，此时 ``--layout`` 不生效。
 
@@ -350,8 +353,8 @@ RPent 负责停止自己启动的桥接服务，并在任务关闭时释放会�
 - ``--vla-backend``：选择 ``vpp2`` （默认）或 ``awomo05``。
 - ``--vla-model-path``：仅用于 VPP2，覆盖 ``VPP2_MODEL_PATH``，指向包含 ``policy/`` 和 ``checkpoints/`` 的资源根目录。
 - ``--env-endpoint``、``--sam3-endpoint``、``--vla-endpoint``：连接已有 RPent RPC 服务；VLA 协议必须匹配所选后端。
-- ``--policy-server-url``：Awomo 上游的 ``ws://`` 或 ``wss://`` 地址，与 ``--vla-endpoint`` 互斥。``--xpolicylab-root`` 为本地桥接服务提供通信代码。
-- ``--vla-agent``：启用 Awomo 协作模式；``--agent-tools`` 选择 ``policy``、``motion``、``geometry`` 或 ``sam3`` 工具组。
+- ``--policy-server-url`` 和 ``--xpolicylab-root``：按 :ref:`robodojo-awomo-run` 配置本地启动的 Awomo 桥接服务。
+- ``--vla-agent``：启用 Awomo 混合控制；``--agent-tools`` 选择 ``policy``、``motion``、``geometry`` 或 ``sam3`` 工具组。
 - ``--source-root``：使用本地 RoboDojo 源码替代包内源码。
 
 子服务继承当前终端的环境变量；CLI 不会自动读取 ``config/runtime.env``。\
@@ -360,7 +363,7 @@ RPent 负责停止自己启动的桥接服务，并在任务关闭时释放会�
 工具
 ----
 
-使用 ``move_to`` 指定绝对位姿，使用 ``move_delta`` 指定相对位姿，使用 ``hold`` 在保持控制器目标不变的情况下推进动作。``rotate_wrist``、``set_gripper`` 和 ``release`` 用于调整姿态与夹爪开度，``vpp2_act`` 执行 VPP2 子任务。Awomo 使用 ``run_policy(max_steps)`` 执行官方指令；运动和感知工具需要启用对应的 ``--vla-agent`` 工具组。规划器不能重置回合；探索模式和 Flash 重放不可用。
+VPP2 模式下可使用 ``vpp2_act`` 及运动和感知工具。Awomo 模式下使用 ``run_policy(max_steps)`` 执行官方指令；运动和感知工具需要启用对应的 ``--vla-agent`` 工具组。规划器不能重置回合；探索模式和 Flash 重放不可用。
 
 ``completed`` 表示本次工具请求是否完成，不代表任务成功。提前停止时检查 ``stop_reason``；``executed_actions`` 与 ``executed_steps`` 均记录已确认执行的动作数。``execution_uncertain=true`` 表示存在可能已执行但无法确认的动作，这些动作不计入确认数。系统不会自动重试，调用方也不应直接重试，以免重复执行。
 
@@ -391,17 +394,49 @@ RPent 负责停止自己启动的桥接服务，并在任务关闭时释放会�
 .. _awomo05-与-agent-协作:
 .. _robodojo-awomo-collaboration:
 
-Awomo05 协作模式
--------------------
+Awomo 执行模式
+--------------
 
-不加 ``--vla-agent`` 时，工具集提供 ``run_policy(max_steps)``、观测工具和 ``finish``。启用后，通过现有规划器和工具集处理阶段计划、证据复查，以及所选的策略、运动、几何查询或 SAM3 工具。``--agent-max-calls`` 和 ``--agent-timeout-s`` 限制协作预算。每次新的控制决策必须复查此前反馈，检查新图像和已确认动作数。协作代理的判断与环境原生成功判定分别记录。协作模式使用新的记忆目录，不接受历史记忆参数和探索模式；支持 API 与 Codex 规划器。
+不加 ``--vla-agent`` 时，规划器通过 ``view_env_state`` 观察，选择有界 ``run_policy(max_steps)`` 调用，最后调用 ``finish``，不能插入运动原语。
 
-多次有界 ``run_policy`` 调用会续接尚未执行的动作块，读取观测不增加历史。动作原语接管会清空待执行动作，并将已确认观测送入模型，保留模型历史。动作块已有进展时，取消会丢弃剩余动作。如果推理已成功返回，但在该动作块的首个动作前取消，RPent 会在暂停期间保留完整动作块。在同一有效环境状态下恢复时，直接使用这些动作，不重复推理或追加历史帧。已有进展时，恢复后则根据最新已确认观测重新推理。动作原语接管仍会清空缓存。推理、执行或观测送达结果不确定时，后续控制会被阻止，必须显式重置；仅恢复执行不能解除这一限制。
+启用 ``--vla-agent`` 后，规划器根据当前观测，自主选择已启用的策略、运动和感知工具，决定调用顺序和预算。两种模式都向 Awomo 传入官方完整任务指令，不改写模型子任务。
+
+混合模式始终提供 ``view_env_state``、``render``、``finish`` 和下文的记忆读取工具；``--agent-tools`` 默认选择 ``policy motion geometry``：
+
+.. list-table:: 工具组与观测要求
+   :header-rows: 1
+
+   * - 工具组
+     - 工具
+     - 所需数据或服务
+   * - ``policy``
+     - ``run_policy``
+     - Awomo 服务、官方完整指令、原生关节状态及三路 RGB
+   * - ``motion``
+     - ``move_to``、``move_delta``、``rotate_wrist``、``set_gripper``、``release``、``hold``
+     - 原生运动状态与规划能力，不要求深度
+   * - ``geometry``
+     - ``back_project``、``sample_world_xyz``、``query_world_map``
+     - 查询视图已保存的同帧深度、有效标定，深度尺寸须与 RGB 一致
+   * - ``sam3``
+     - ``segment``
+     - SAM3 服务和选定记录中的 RGB，不要求深度
+
+即使未启用 ``policy`` 工具组，Awomo 会话仍需要模型服务同步历史。头部和双腕 RGB 始终必需；只有启用的几何查询需要对应深度与标定。缺少几何数据时查询报错，已提供但格式无效的数据会导致捕获失败。同一记录的 RGB、深度和标定来自同次观测。
+
+``run_policy(max_steps)`` 限制单次调用的原生动作数，不是动作块数。预算截断后可续接未消费动作；运动原语实际执行动作后才会清空旧动作块，并保留模型历史。拒绝或零动作调用不算接管，只读查询不推进动作或模型历史。
+
+所有控制共享 ``--max-episode-steps``。规划过程由 ``--max-turns`` 和 ``--planner-timeout-s`` 按所选 :doc:`规划器 <../guides/configure_planner>` 的语义约束，规划轮次不等于工具调用次数。中断与恢复见 :ref:`robodojo-awomo-troubleshooting`。
+
+任务记忆
+--------
+
+Awomo 混合模式沿用现有 :doc:`记忆配置 <../guides/memory>` 读取已有经验；``list_dir`` 和 ``read_text_file`` 仅允许读取配置的经验目录，不能写入记忆。任务源码、评估器和隐藏资产不属于任务访问接口。当前指令与新观测优先于历史经验；探索和 Flash 回放仍不支持。Codex 工具来源控制见 :ref:`Planner 指南 <planner-codex>`。
 
 .. _robodojo-awomo-troubleshooting:
 
 Awomo 启动与恢复排查
-~~~~~~~~~~~~~~~~~~~~
+--------------------
 
 权重和推理错误查看模型终端；WebSocket 或元数据错误查看 ``awomo05_bridge.log``；场景启动错误查看 ``robodojo_env_server.log``。重新运行前，检查对应条件：
 
@@ -409,7 +444,11 @@ Awomo 启动与恢复排查
 - 缺少 ``get_model_meta`` 或元数据不兼容：使用 RPent 的模型启动入口，保持 ``arx_x5``、绝对 ``joint`` 动作、BGR 输入和 25 Hz 历史。普通 VPP2 或旧策略端点不是 Awomo 端点。
 - 连接被拒绝：等待模型的监听日志，确认桥接服务能访问指定主机和端口，并区分 WebSocket 与 RPent RPC 地址。端口监听本身不能证明模型兼容或推理成功。
 - 重置时报 ``All scene Unstable Error``：检查前文的 ``ROBODOJO_PLACEMENT_SETTLE_STEPS=1000`` 设置和场景资源。
-- 推理或执行结果不确定：不要重试可能已执行的动作，也不要续用旧动作。显式重置环境；会话不提供重置操作时，开始新回合。已确认的取消按上文规则恢复，不重置模型历史。
+- 已确认的取消会暂停控制，可通过现有会话控制恢复；缓存由 RPent 处理，不重置模型历史。
+- 推理、执行或观测交付结果不确定时，不要重试或直接恢复。反馈仍保留已确认进度，但后续控制会被阻止。检查已保存记录和错误后开始新回合；规划器没有 reset 工具。显式重置环境会重新建立模型历史。
+
+
+.. _robodojo-awomo-verification:
 
 有界验证
 ~~~~~~~~
@@ -425,7 +464,7 @@ Awomo 启动与恢复排查
    RPENT_E2E_OUTPUT_DIR=/path/to/new-output \
      pytest tests/e2e_tests/robodojo/test_awomo_bounded.py -v -s
 
-组件检查覆盖真实推理、动作块续接、动作原语接管和重置。公共 CLI 检查使用本地脚本规划器执行 policy → primitive → policy → finish，验证图像、执行记录、动作计数和清理。原生任务成功结果应单独报告：集成检查通过不代表任务成功，也不能据此得出基准成功率。
+这些检查使用真实推理和脚本规划器验证集成链路，不评估在线 LLM 的规划质量或任务成功率。原生任务成功结果应单独报告。详细覆盖范围与跳过条件见 ``tests/README.md``。
 
 .. _robodojo-local-nvidia-assets:
 

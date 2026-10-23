@@ -4,7 +4,8 @@ RoboDojo
 Run bimanual tabletop tasks with RPent in RoboDojo. The simulator uses
 Isaac Sim / IsaacLab with an ARX-X5 dual-arm platform. Choose VPP2 (the default)
 or Awomo05 for policy actions. Native motion primitives and SAM3 segmentation
-are available with VPP2 or the corresponding Awomo agent tool groups.
+are available in VPP2 mode; Awomo mixed mode enables them through the
+corresponding tool groups.
 
 Overview
 --------
@@ -65,9 +66,9 @@ Observation and Action
    * - Item
      - Description
    * - Observation
-     - Head and left/right wrist RGB-D images, camera calibration, and joint states, end-effector poses, and gripper states for both arms.
+     - Head and left/right wrist RGB-D images, camera calibration, and joint states, end-effector poses, and gripper states for both arms. Depth and calibration are used for geometry queries; Awomo policy execution itself does not require depth.
    * - Action
-     - VPP2: ``vpp2_act`` and native primitives (``move_to``, ``move_delta``, ``rotate_wrist``, ``set_gripper``, ``release``, ``hold``). Awomo05: ``run_policy``; ``--vla-agent`` adds selected motion and perception tools. ``finish`` cannot override the native task verdict.
+     - VPP2 mode offers ``vpp2_act`` and native motion primitives (``move_to``, ``move_delta``, ``rotate_wrist``, ``set_gripper``, ``release``, ``hold``). Awomo05 mode offers ``run_policy``; ``--vla-agent`` adds selected motion and perception tools. ``finish`` cannot override the native task verdict.
    * - Reward / success
      - RoboDojo's native environment determines task success, recorded in the ``success`` field of ``result.json``.
    * - Task prompt
@@ -173,7 +174,6 @@ weights and does not use ``VPP2_MODEL_PATH`` or ``--vla-model-path``.
 VPP2 Setup
 ~~~~~~~~~~
 
-VPP2 is selected with ``--vla-backend vpp2``.
 Prepare the official
 `VPP2 RoboDojo implementation <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_
 and the paired 100k weights from
@@ -233,8 +233,7 @@ Awomo05 Setup
 
 Use the official `XPolicyLab Awomo05 installation and asset guide
 <https://github.com/XPolicyLab/XPolicyLab/blob/562c14cf08b9e6e411e7d76f192740afced77160/policy/Awomo05/README.md>`_.
-The model environment is separate from Isaac Sim: its installation script pins
-PyTorch 2.8.0, Transformers 5.5.0 and PEFT 0.5.0. The RPent bridge only needs
+The model environment is separate from Isaac Sim. The RPent bridge only needs
 RPent and XPolicyLab's WebSocket dependencies, so it can run in the RPent
 simulation environment without installing the Awomo model dependencies there.
 
@@ -291,8 +290,8 @@ for the simulator in :ref:`robodojo-awomo-run`; adjust both to free devices:
      input_color_order=bgr replan_steps=8
 
 Wait for ``Awomo05 ready`` followed by ``websocket policy server listening``
-in the model terminal. These indicate model initialization and listener startup;
-they do not establish a successful inference. Keep the terminal running.
+in the model terminal. These indicate model initialization and listener startup.
+Keep the terminal running.
 The wrapper exposes ``get_model_meta`` for bridge validation. Preserve BGR
 configuration, 25 Hz history, the native joint layout and the official task
 instruction; RPent does not reorder actions or add image transforms.
@@ -380,6 +379,8 @@ read saved state and ``finish``. For mixed control, add
 ``--vla-agent --agent-tools policy motion geometry``; see
 :ref:`robodojo-awomo-collaboration` for tool and planner restrictions.
 
+.. _robodojo-existing-rpc:
+
 Existing RPC Service (Alternative)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -398,12 +399,17 @@ In the task command, replace ``--policy-server-url``, ``--xpolicylab-root`` and
 externally managed service may also use ``socket://host:port``; the bridge
 command above serves HTTP. The RPC protocol must match ``--vla-backend``:
 VPP2 uses the VPP2 protocol, and Awomo uses the session and metadata contract.
-Neither endpoint option points to a model directory.
 
-RPent stops bridges it starts and releases its session at task close. Borrowed
-RPC and model services keep running; their operator owns shutdown. Startup
-failure closes pending RPC sessions and stops components already started by RPent.
-Dashboard uses the same backend-specific starters and connectors.
+RPent releases the policy episode when a task finishes and stops bridges it
+started when their runtime closes. Connected model and RPC services remain under
+their operator's control. Startup failure closes pending connections and stops
+components already started by RPent.
+
+Use one bridge per upstream model, and let only that bridge execute episodes.
+The official server shares model history across connections. Session ownership
+prevents concurrent episodes within one bridge, but cannot coordinate separate
+bridges or other clients connected directly to the model. For parallel runs,
+start a separate model service for each bridge.
 
 View Results
 ------------
@@ -413,24 +419,29 @@ run, inspect these files in the directory selected by ``--output-dir``:
 
 - ``result.json``: the environment's task verdict and run error status.
 - ``states.json``: commands, execution results and synchronized observation records.
-- Per-step RGB, metric depth, calibration and world-xyz artifacts for available cameras.
+- Per-step RGB images; available metric depth, calibration and world-xyz artifacts
+  are also saved when geometry tools are enabled.
 - ``videos/``: head, left-wrist, and right-wrist camera videos.
 - ``robodojo_env_server.log``: simulator startup and errors. VPP2 also writes
   ``sam3_server.log`` and ``robodojo_vpp2_server.log`` for locally started services.
   An automatically started Awomo bridge writes ``awomo05_bridge.log``; its
   separately started model logs to the model terminal. SAM3 logs appear for
   Awomo only when that component is started.
-- ``agent-decisions.json`` in Awomo agent mode: stage plans, tool feedback and
-  the planner's subsequent reviews.
 - ``run.log`` and ``transcript_*.json``: main-process logs, planner conversations,
   and errors.
 
 Check ``environment_result_available=true`` and
-``agent_error_present=false`` first, then inspect whether ``success`` is
-``true``. This field records RoboDojo's native task verdict; ``finish`` ends
-the planner loop. Awomo ``run_policy`` reports confirmed ``executed_steps``,
-``observation_step``, ``pending_actions`` and ``stop_reason`` in ``states.json``. A completed call
-or ended episode is not a native success verdict; agent assessments are separate.
+``agent_error_present=false`` first, then inspect ``success``. This is RoboDojo's
+native verdict; a completed tool call, ended episode or planner ``finish`` is
+not proof of success. For Awomo, ``finish.agent_assessment`` records the planner's
+separate assessment.
+
+``states.json`` retains complete Awomo execution results, including
+``executed_steps``, ``pending_actions``, ``stop_reason`` and ``inferences`` with
+same-call metadata. Planner responses show ``inference_count`` instead of the
+full inference list. ``step``/``step_idx`` selects a saved observation record;
+``executed_steps`` counts confirmed actions in a call; ``observation_step`` is
+relative to the model session. Do not interchange these indices.
 
 Without ``--output-dir``, results go to
 ``logs/<timestamp>_robodojo_<task>_s<seed>_l<layout>/``. Use different directories for
@@ -439,10 +450,11 @@ concurrent runs. For live monitoring, see :doc:`../guides/dashboard`.
 Common Options
 --------------
 
-The default VPP2 backend starts the simulator, SAM3 and VPP2 locally. Awomo
-starts the simulator and connects to its policy service; SAM3 is added only
-when the agent selects it. ``--sim-python`` selects the simulator interpreter;
-``--policy-python`` selects the Awomo bridge interpreter, not the model process.
+CLI and Dashboard share the same defaults: VPP2 starts the simulator, SAM3
+and VPP2 locally; Awomo starts the simulator and connects to its model, adding
+SAM3 only when selected by the tool groups. ``--sim-python`` selects the
+simulator interpreter; ``--policy-python`` selects the Awomo bridge interpreter,
+not the model process.
 
 Use ``--task`` to select a task. For a fixed scene, ``--seed`` selects an
 official layout group and ``--layout`` selects a layout within that group;
@@ -457,11 +469,10 @@ in this mode.
 - ``--vla-model-path`` applies to VPP2, overrides ``VPP2_MODEL_PATH`` and points to the resource
   root containing ``policy/`` and ``checkpoints/``.
 - ``--env-endpoint``, ``--sam3-endpoint`` and ``--vla-endpoint`` connect to
-  existing RPent RPC services. The VLA protocol must match the selected backend.
-- ``--policy-server-url`` is an Awomo ``ws://`` or ``wss://`` upstream URL and
-  cannot be combined with ``--vla-endpoint``. ``--xpolicylab-root`` supplies the
-  transport checkout for a locally started bridge.
-- ``--vla-agent`` enables Awomo collaboration; ``--agent-tools`` selects
+  existing RPent RPC services; see :ref:`robodojo-existing-rpc` for VLA endpoints.
+- ``--policy-server-url`` and ``--xpolicylab-root`` configure the locally started
+  Awomo bridge as shown in :ref:`robodojo-awomo-run`.
+- ``--vla-agent`` enables Awomo mixed control; ``--agent-tools`` selects
   ``policy``, ``motion``, ``geometry`` or ``sam3`` tool groups.
 - ``--source-root`` selects a local RoboDojo checkout instead of the packaged code.
 
@@ -472,13 +483,10 @@ for the full option list.
 Tools
 -----
 
-Use ``move_to`` for an absolute pose, ``move_delta`` for a relative pose, and
-``hold`` to advance actions with unchanged controller targets. ``rotate_wrist``,
-``set_gripper`` and ``release`` control orientation and gripper opening;
-``vpp2_act`` executes a VPP2 subtask. Awomo exposes ``run_policy(max_steps)``
-on the official instruction; motion and perception tools require the matching
-``--vla-agent`` groups. The planner cannot reset an episode; exploration and
-Flash replay are unavailable.
+VPP2 mode offers ``vpp2_act`` and motion and perception tools. Awomo mode offers
+``run_policy(max_steps)`` on the official instruction; motion and perception
+tools require the matching ``--vla-agent`` groups. The planner cannot reset an
+episode; exploration and Flash replay are unavailable.
 
 ``completed`` indicates completion of the tool request, not task success.
 Check ``stop_reason`` for early stops; ``executed_actions`` and
@@ -563,34 +571,73 @@ termination, the action budget or cancellation can stop execution early.
 
 .. _robodojo-awomo-collaboration:
 
-Awomo05 and Agent Collaboration
--------------------------------
+Awomo Execution Modes
+---------------------
 
-Without ``--vla-agent``, the toolkit exposes ``run_policy(max_steps)`` and
-observation/finish tools. With it, the existing planner and toolkit dispatch
-stage planning, evidence reviews and the selected policy, motion, geometry or
-SAM3 tools. ``--agent-max-calls`` and ``--agent-timeout-s`` bound collaboration.
-Each new control decision must review the preceding feedback; inspect fresh
-images and confirmed action counts. Agent assessment and native success are
-recorded separately. Agent runs use fresh memory; historical memory arguments
-and exploration are rejected. API and Codex planners are supported.
+Without ``--vla-agent``, the planner observes through ``view_env_state`` and
+chooses bounded ``run_policy(max_steps)`` calls before ``finish``. It cannot
+insert motion primitives.
 
-Awomo continues unconsumed chunks across bounded ``run_policy`` calls. Reads do
-not add observations. A primitive discards pending actions but delivers its
-confirmed observation without resetting model history. Cancellation discards
-the remainder of a chunk once it has made progress. If inference returned
-successfully but cancellation occurred before that chunk's first action,
-RPent retains the whole chunk while paused. Resuming at the same valid
-environment state uses those actions without another inference or duplicate
-history frame. After progress, resume instead replans from the latest confirmed
-observation. Primitive takeover still discards the cache. Uncertain inference,
-execution or observation delivery blocks further control until an explicit
-reset; resuming alone does not recover it.
+With ``--vla-agent``, the planner chooses among the enabled policy, motion and
+perception tools, deciding call order and budgets from current observations.
+Both modes pass the original full task instruction to Awomo; the planner does
+not rewrite model subtasks.
+
+Mixed control always provides ``view_env_state``, ``render``, ``finish`` and the
+memory readers described below. ``--agent-tools`` defaults to
+``policy motion geometry``:
+
+.. list-table:: Tool groups and observation requirements
+   :header-rows: 1
+
+   * - Group
+     - Tools
+     - Required data or service
+   * - ``policy``
+     - ``run_policy``
+     - Awomo service, original instruction, native joint state and three RGB views
+   * - ``motion``
+     - ``move_to``, ``move_delta``, ``rotate_wrist``, ``set_gripper``, ``release``, ``hold``
+     - Native motion state and planning; no depth requirement
+   * - ``geometry``
+     - ``back_project``, ``sample_world_xyz``, ``query_world_map``
+     - Saved RGB-aligned depth and valid calibration for the queried view
+   * - ``sam3``
+     - ``segment``
+     - SAM3 service and the selected saved RGB image; no depth requirement
+
+All Awomo sessions need the model service for history synchronization, even
+without the ``policy`` tool group. Head and wrist RGB images are always required;
+depth and calibration are needed only for enabled geometry queries. Missing
+geometry produces a query error; malformed supplied geometry fails capture.
+Saved RGB, depth and calibration belong to the same observation.
+
+``run_policy(max_steps)`` limits native actions in one call, not model action
+chunks. Budget returns retain unused actions for continuation. A motion primitive
+that actually executes actions discards the old chunk while preserving model
+history; rejected or zero-action calls do not take over. Read-only queries do
+not advance actions or model history.
+
+All controls share ``--max-episode-steps``. Planner limits remain
+``--max-turns`` and ``--planner-timeout-s`` with the semantics of the selected
+:doc:`planner <../guides/configure_planner>`; turns are not tool-call counts.
+For interruption and recovery, see :ref:`robodojo-awomo-troubleshooting`.
+
+Task Memory
+-----------
+
+Awomo mixed mode uses the existing :doc:`memory configuration <../guides/memory>`
+to read prior experience. ``list_dir`` and ``read_text_file`` only allow reads
+within the configured experience directory and cannot write memory. Task source, evaluators
+and hidden assets are not part of the task access interface. Current instructions
+and observations take precedence over prior experience. Exploration and Flash
+replay are unsupported. For Codex tool sources, see the
+:ref:`Planner guide <planner-codex>`.
 
 .. _robodojo-awomo-troubleshooting:
 
 Awomo Startup and Recovery
-~~~~~~~~~~~~~~~~~~~~~~~~~~
+--------------------------
 
 Use the model terminal for weight and inference errors, ``awomo05_bridge.log``
 for WebSocket or metadata failures, and ``robodojo_env_server.log`` for scene
@@ -607,10 +654,15 @@ startup failures. Check these conditions before rerunning:
   A listening socket alone does not validate model compatibility or inference.
 - ``All scene Unstable Error`` during reset: check the existing
   ``ROBODOJO_PLACEMENT_SETTLE_STEPS=1000`` setting and scene resources.
-- Uncertain inference or execution: do not retry a mutation or resume stale
-  actions. Explicitly reset the environment, or start a new episode when the
-  session offers no reset operation. Known cancellation follows the resume
-  rules above and does not reset model history.
+- Known cancellation pauses control. Resume through the existing session
+  controls; RPent handles cached actions without resetting model history.
+- Uncertain inference, execution or observation delivery: do not retry or resume.
+  Confirmed progress remains in the feedback, but further control is blocked.
+  Inspect any saved record and error, then start a new episode; the planner has
+  no reset tool. An explicitly reset environment starts fresh model history.
+
+
+.. _robodojo-awomo-verification:
 
 Bounded Verification
 ~~~~~~~~~~~~~~~~~~~~
@@ -630,11 +682,9 @@ from the first run:
    RPENT_E2E_OUTPUT_DIR=/path/to/new-output \
      pytest tests/e2e_tests/robodojo/test_awomo_bounded.py -v -s
 
-The component test checks real inference, chunk continuation, primitive takeover
-and reset. The public CLI test uses a local scripted planner for
-policy → primitive → policy → finish, checking images, trace, action counts and
-cleanup. Report native success separately: a passing integration check does
-not establish task success or a benchmark success rate.
+These checks use real inference and a scripted planner to verify integration,
+not online LLM planning quality or task success rate. Report native task success
+separately. See ``tests/README.md`` for coverage and skip conditions.
 
 .. _robodojo-local-nvidia-assets:
 

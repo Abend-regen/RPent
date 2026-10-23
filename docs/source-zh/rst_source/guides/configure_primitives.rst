@@ -28,7 +28,7 @@ RPent 的动作工具主要分为两类：
    * - :doc:`../simulators/robotwin`
      - LingBot-VLA
    * - :doc:`../simulators/robodojo`
-     - VPP2（默认）/ Awomo05
+     - VPP2, Awomo05
    * - :doc:`../real_world_robots/franka`
      - Pi0.5 / openpi
    * - :doc:`../real_world_robots/dual_franka`

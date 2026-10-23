@@ -28,7 +28,7 @@ Models by Platform
    * - :doc:`../simulators/robotwin`
      - LingBot-VLA
    * - :doc:`../simulators/robodojo`
-     - VPP2 (default) / Awomo05
+     - VPP2, Awomo05
    * - :doc:`../real_world_robots/franka`
      - Pi0.5 / openpi
    * - :doc:`../real_world_robots/dual_franka`
