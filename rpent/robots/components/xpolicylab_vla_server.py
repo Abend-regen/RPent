@@ -42,21 +42,28 @@ from rpent.utils.logging import get_logger
 logger = get_logger("vla_server")
 
 
+def add_connection_args(
+    parser: argparse.ArgumentParser, *, required: bool = False
+) -> None:
+    """Register the upstream WebSocket connection and evaluation identity."""
+    parser.add_argument("--task", required=required)
+    parser.add_argument("--evaluation-id")
+    parser.add_argument("--policy-server-url", required=required)
+
+
 def add_backend_args(parser: argparse.ArgumentParser) -> None:
     """Register XPolicyLab launch and WebSocket configuration."""
+    add_connection_args(parser)
     for name in (
-        "task",
         "bench",
         "ckpt",
         "env-cfg-type",
         "action-type",
         "policy-root",
-        "evaluation-id",
     ):
         parser.add_argument(f"--{name}")
     parser.add_argument("--policy-gpu", type=int, default=None)
     parser.add_argument("--policy-port", type=int, default=0)
-    parser.add_argument("--policy-server-url")
     parser.add_argument(
         "--stateful",
         action="store_true",

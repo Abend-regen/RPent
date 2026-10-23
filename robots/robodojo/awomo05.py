@@ -16,9 +16,6 @@
 
 from __future__ import annotations
 
-import argparse
-import os
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -30,9 +27,6 @@ from robots.robodojo.awomo05_contract import (
     validate_native_state,
 )
 from rpent.robots.components.xpolicylab_vla_client import XPolicyLabVLAClient
-from rpent.utils.config import get_repo_root
-from rpent.utils.daemon import ProcessDaemon, pick_free_port
-from rpent.utils.rpc.http_rpc import HttpRpcClient
 
 
 class Awomo05Client(XPolicyLabVLAClient):
@@ -67,31 +61,19 @@ class Awomo05Client(XPolicyLabVLAClient):
             raise ValueError("Awomo05 requires the official task instruction")
         # Agent geometry may include depth/calibration. Keep the learned
         # model's inputs at the official RGB + joint-state + language boundary.
-        if (
-            set(obs) == {"instruction", "state", "vision"}
-            and set(obs["state"]) == set(STATE_FIELDS)
-            and set(obs["vision"]) == set(CAMERAS)
-            and all(set(obs["vision"][name]) == {"color"} for name in CAMERAS)
-        ):
-            payload = obs
-        else:
-            payload = {
-                "instruction": obs["instruction"],
-                "state": {key: obs["state"][key] for key in STATE_FIELDS},
-                "vision": {
-                    name: {"color": obs["vision"][name]["color"]} for name in CAMERAS
-                },
-            }
+        payload = {
+            "instruction": obs["instruction"],
+            "state": {key: obs["state"][key] for key in STATE_FIELDS},
+            "vision": {
+                name: {"color": obs["vision"][name]["color"]} for name in CAMERAS
+            },
+        }
         super().update_obs(payload, step)
 
     def get_action(self) -> list[dict[str, Any]]:
         self.last_action_info = {}
         if self.model_meta.get("action_info"):
-            result = self._client.call(
-                "vla.get_action",
-                kwargs={"include_info": True},
-                timeout_s=self._TIMEOUT_S["predict"],
-            )
+            result = super().get_action(include_info=True)
             if (
                 not isinstance(result, dict)
                 or "actions" not in result
@@ -114,58 +96,3 @@ class Awomo05Client(XPolicyLabVLAClient):
                 raise ValueError("Awomo05 returned unexpected action fields")
             validate_native_state(action)
         return actions
-
-
-def spawn_bridge(
-    args: argparse.Namespace, output_dir: Path
-) -> tuple[ProcessDaemon, HttpRpcClient]:
-    """Start only the CPU bridge, borrowing an independently managed model server."""
-    interpreter = Path(args.pi05_python).expanduser()
-    if not interpreter.is_file():
-        raise ValueError(f"Policy bridge Python not found: {interpreter}")
-    root = (
-        Path(args.xpolicylab_root).expanduser()
-        if args.xpolicylab_root
-        else (
-            Path(args.source_root).expanduser() / "XPolicyLab"
-            if args.source_root
-            else None
-        )
-    )
-    if root is None or not (root / "client_server/ws/model_client.py").is_file():
-        raise ValueError(
-            "Awomo05 WebSocket connection requires --xpolicylab-root or --source-root"
-        )
-    root = root.resolve()
-    host, port = "127.0.0.1", pick_free_port()
-    daemon = ProcessDaemon(
-        name="robodojo_awomo05_bridge",
-        cmd=[
-            str(interpreter),
-            "-u",
-            "-m",
-            "robots.robodojo.awomo05_bridge",
-            "--task",
-            args.task,
-            "--policy-server-url",
-            args.policy_server_url,
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--parent-watch",
-        ],
-        env_overrides={
-            "PYTHONPATH": os.pathsep.join(
-                [str(get_repo_root()), str(root.parent), str(root)]
-                + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])
-            )
-        },
-        log_path=str(output_dir / "awomo05_bridge.log"),
-    )
-    try:
-        daemon.start()
-    except BaseException:
-        daemon.stop()
-        raise
-    return daemon, HttpRpcClient(f"http://{host}:{port}", enable_sessions=True)

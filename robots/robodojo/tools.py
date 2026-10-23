@@ -323,9 +323,19 @@ CAMERA_ARTIFACTS: tuple[tuple[str, str], ...] = (
 )
 
 
+def planner_result(result: dict | None) -> dict | None:
+    """Build a presentation copy; the standard record retains full inference info."""
+    if result is None:
+        return None
+    summary = {key: value for key, value in result.items() if key != "inferences"}
+    if "inferences" in result:
+        summary["inference_count"] = len(result["inferences"])
+    return summary
+
+
 @tool(readonly=True, exclude=("state",))
 def view_env_state(step: int = -1, *, state: Any) -> ToolResult:
-    """Read one recorded RoboDojo state: robot joint/ee state, camera shapes and calibration, the task instruction, and the three camera RGB images (cam_head, cam_left_wrist, cam_right_wrist). Step -1 selects the latest record.
+    """Read one recorded RoboDojo state: robot joint/ee state, the task instruction and camera RGB images. Geometry metadata is included when geometry tools are enabled. Step -1 selects the latest record.
 
     Args:
         step: Recorded step to read (-1 = latest)"""
@@ -343,20 +353,17 @@ def view_env_state(step: int = -1, *, state: Any) -> ToolResult:
     }
     result["log"] = {
         "command": record.command,
-        "result": record.result,
+        "result": planner_result(record.result),
         "elapsed_s": record.elapsed_s,
     }
     images: list[bytes] = []
     for _, artifact in CAMERA_ARTIFACTS:
         if artifact in record.artifacts:
-            try:
-                images.append(state.load_bytes(artifact, step=record.step_idx))
-            except FileNotFoundError:
-                pass
+            images.append(state.load_bytes(artifact, step=record.step_idx))
     return ToolResult(data=result, images=images)
 
 
-def _summarize_obs(obs: dict) -> dict:
+def _summarize_obs(obs: dict, *, geometry: bool = True) -> dict:
     from robots.robodojo.access import public_observation
 
     obs = public_observation(obs)
@@ -366,11 +373,19 @@ def _summarize_obs(obs: dict) -> dict:
         "instruction": obs.get("instruction"),
         "cameras": {
             name: {
-                "shape": cam.get("shape"),
-                "has_depth": cam.get("distance_to_image_plane") is not None
-                or cam.get("depth") is not None,
-                "intrinsic_matrix": _jsonable(cam.get("intrinsic_matrix")),
-                "extrinsic_matrix": _jsonable(cam.get("extrinsic_matrix")),
+                "shape": list(np.asarray(cam["color"]).shape)
+                if cam.get("color") is not None
+                else None,
+                **(
+                    {
+                        "has_depth": cam.get("distance_to_image_plane") is not None
+                        or cam.get("depth") is not None,
+                        "intrinsic_matrix": _jsonable(cam.get("intrinsic_matrix")),
+                        "extrinsic_matrix": _jsonable(cam.get("extrinsic_matrix")),
+                    }
+                    if geometry
+                    else {}
+                ),
                 "color_dtype": str(cam.get("color", type(None)).dtype)
                 if hasattr(cam.get("color"), "dtype")
                 else None,
@@ -441,7 +456,7 @@ def segment(
     min_score: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)] = 0.2,
     step: int | None = None,
 ) -> ToolResult:
-    """Segment a saved camera image with SAM3. Inspect the returned red-mask overlay before using point_rc with back_project at the same camera and step_idx. This tool does not move the robot or compute a grasp pose.
+    """Segment a saved camera image with SAM3. Inspect the returned red-mask overlay before using point_rc. It is an image pixel, not a grasp pose; any later geometry query must use the same camera and step_idx. This tool does not move the robot.
 
     Args:
         text_prompt: e.g. 'the bottle'
@@ -463,7 +478,7 @@ def segment(
     if sam3 is None:
         payload = {"error": "sam3_client not configured"}
         return ToolResult(data=payload)
-    fallback = "Use a visible pixel with back_project or sample_world_xyz on the same saved frame."
+    fallback = "Inspect another saved view or revise the description; use only available tools."
     try:
         result = sam3.segment(color, text_prompt=text_prompt, min_score=min_score)
     except Exception as exc:
@@ -731,21 +746,32 @@ def _jsonable(obj):
     return obj
 
 
-def dump_state(primitives, state, *, log: dict | None = None, perception=None):
+def dump_state(
+    primitives,
+    state,
+    *,
+    log: dict | None = None,
+    perception=None,
+    geometry: bool = True,
+    require_rgb: bool = False,
+):
     """Record one RoboDojo observation and save its camera artifacts.
 
     Fetches a live observation, appends a :class:`StepRecord` through
     :meth:`EnvState.record_step`, writes the three camera RGB PNGs for that
     step, and returns the record.
     """
+    before = primitives.env.get_status()
     obs = _refresh_obs(primitives)
     status = primitives.env.get_status()
-    if getattr(primitives, "require_rgbd", False):
-        from robots.robodojo.access import validate_rgbd
+    if before["step"] != status["step"]:
+        raise RuntimeError("native control advanced during observation capture")
+    if require_rgb:
+        from robots.robodojo.access import validate_rgb
 
-        validate_rgbd(obs)
+        validate_rgb(obs)
     log = log or {}
-    summary = _summarize_obs(obs)
+    summary = _summarize_obs(obs, geometry=geometry)
     step_idx = 0 if state.latest_step is None else state.latest_step + 1
     summary.update(step_idx=step_idx, artifacts={}, view_specs={})
     summary["control"] = {
@@ -771,12 +797,17 @@ def dump_state(primitives, state, *, log: dict | None = None, perception=None):
         depth = cam.get("distance_to_image_plane")
         if depth is None:
             depth = cam.get("depth")
-        if depth is not None:
+        if geometry and depth is not None:
             if np.asarray(depth).shape != shape:
-                raise ValueError("RGB and depth must have the same image dimensions")
-            world = _world_from_depth(
-                depth, cam.get("intrinsic_matrix"), cam.get("extrinsic_matrix")
-            )
+                raise ValueError(
+                    f"{camera}: RGB and depth must have the same image dimensions"
+                )
+            try:
+                world = _world_from_depth(
+                    depth, cam.get("intrinsic_matrix"), cam.get("extrinsic_matrix")
+                )
+            except ValueError as exc:
+                raise ValueError(f"{camera}: {exc}") from exc
             views[view] = {
                 "depth": np.asarray(depth),
                 "world_xyz": world,
@@ -807,8 +838,11 @@ def dump_state(primitives, state, *, log: dict | None = None, perception=None):
         for camera, artifact in CAMERA_ARTIFACTS:
             color = (vision.get(camera) or {}).get("color")
             if color is not None:
-                state.save(artifact, color, step=step_idx)
+                if state.save(artifact, color, step=step_idx) is None:
+                    raise OSError(f"could not save observation artifact: {artifact}")
         for view, fields in views.items():
             for field, value in fields.items():
-                state.save(_artifact_name(view, field), value, step=step_idx)
+                artifact = _artifact_name(view, field)
+                if state.save(artifact, value, step=step_idx) is None:
+                    raise OSError(f"could not save observation artifact: {artifact}")
     return state.get(step_idx)

@@ -32,10 +32,7 @@ else:
 class ModelWithMetadata:
     """Delegate all inference and state operations to the official model."""
 
-    def __init__(self, model: Any, cfg: dict) -> None:
-        history_cfg = model.run_cfg.data.train.get("history") or {}
-        if float(cfg.get("history_fps") or history_cfg.get("fps", 25)) != 25:
-            raise ValueError("Awomo05 RoboDojo history must advance at 25 Hz")
+    def __init__(self, model: Any, *, history_fps: float) -> None:
         self._model = model
         self._meta = validate_model_meta(
             {
@@ -46,7 +43,7 @@ class ModelWithMetadata:
                 "action_layout": "native_joint_dict",
                 "camera_order": list(model.cameras),
                 "input_color_order": model.input_color_order,
-                "control_hz": 25,
+                "control_hz": history_fps,
                 "history_enabled": model.history_grid is not None,
                 "action_horizon": model.action_horizon,
                 "replan_steps": model.replan_steps,
@@ -69,12 +66,18 @@ def main() -> None:
     # Optional model/server dependencies stay entirely in this interpreter.
     from client_server.ws.model_server import PolicyServer, PolicyServerConfig
     from setup_policy_server import parse_args_and_config
-    from XPolicyLab.policy.Awomo05.model import Model
+    from XPolicyLab.policy.Awomo05.model import RAW_FPS, Model, _opt_float
 
     cfg = parse_args_and_config()
     if cfg.get("policy_name") != "Awomo05" or cfg.get("protocol") != "ws":
         raise ValueError("Use the official Awomo05 deploy.yml with protocol=ws")
-    model = ModelWithMetadata(Model(cfg), cfg)
+    native = Model(cfg)
+    history_cfg = native.run_cfg.data.train.get("history") or {}
+    # Match the official model's optional-value parsing and history-grid rate.
+    history_fps = _opt_float(native.model_cfg.get("history_fps")) or float(
+        history_cfg.get("fps", RAW_FPS)
+    )
+    model = ModelWithMetadata(native, history_fps=history_fps)
     server = PolicyServer(
         model, PolicyServerConfig(host=cfg["host"], port=int(cfg["port"]))
     )

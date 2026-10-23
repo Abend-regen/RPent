@@ -343,6 +343,7 @@ class RoboDojoPrimitives:
                     "_finish": True,
                     "status": "error",
                     "summary": summary,
+                    "agent_assessment": status,
                     "runtime_error": str(exc),
                 }
             )
@@ -359,6 +360,7 @@ class RoboDojoPrimitives:
                 "_finish": True,
                 "status": reported,
                 "summary": summary,
+                "agent_assessment": status,
                 "requested_success": status.lower() == "success",
                 "success": success,
                 "episode_status": native,

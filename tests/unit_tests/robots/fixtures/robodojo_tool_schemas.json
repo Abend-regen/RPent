@@ -100,7 +100,7 @@
   },
   "view_env_state": {
     "name": "view_env_state",
-    "description": "Read one recorded RoboDojo state: robot joint/ee state, camera shapes and calibration, the task instruction, and the three camera RGB images (cam_head, cam_left_wrist, cam_right_wrist). Step -1 selects the latest record.",
+    "description": "Read one recorded RoboDojo state: robot joint/ee state, the task instruction and camera RGB images. Geometry metadata is included when geometry tools are enabled. Step -1 selects the latest record.",
     "input_schema": {
       "properties": {
         "step": {
@@ -149,7 +149,7 @@
   },
   "segment": {
     "name": "segment",
-    "description": "Segment a saved camera image with SAM3. Inspect the returned red-mask overlay before using point_rc with back_project at the same camera and step_idx. This tool does not move the robot or compute a grasp pose.",
+    "description": "Segment a saved camera image with SAM3. Inspect the returned red-mask overlay before using point_rc. It is an image pixel, not a grasp pose; any later geometry query must use the same camera and step_idx. This tool does not move the robot.",
     "input_schema": {
       "properties": {
         "text_prompt": {
@@ -373,7 +373,7 @@
   },
   "render": {
     "name": "render",
-    "description": "Refresh the synchronized RGB-D, calibration and robot state record.",
+    "description": "Capture fresh RGB and robot state, plus available geometry for enabled tools.",
     "input_schema": {
       "properties": {},
       "type": "object"

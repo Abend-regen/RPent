@@ -24,37 +24,12 @@ from robots.robodojo import robot_spec
 from robots.robodojo.awomo05 import Awomo05Client
 from robots.robodojo.awomo05_contract import (
     CAMERAS,
-    POLICY_METHODS,
-    SESSION_METHODS,
     STATE_FIELDS,
     validate_model_meta,
 )
 from robots.robodojo.awomo05_policy_server import ModelWithMetadata
-
-
-def metadata():
-    return {
-        "policy_name": "Awomo05",
-        "env_cfg_type": "arx_x5",
-        "action_type": "joint",
-        "action_dim": 14,
-        "action_layout": "native_joint_dict",
-        "camera_order": list(CAMERAS),
-        "input_color_order": "bgr",
-        "control_hz": 25,
-        "history_enabled": True,
-        "action_horizon": 16,
-        "replan_steps": 8,
-        "methods": list(POLICY_METHODS),
-        "stateful": True,
-        "rpc_methods": list(SESSION_METHODS),
-    }
-
-
-def args(*flags):
-    parser = argparse.ArgumentParser()
-    robot_spec._add_cli_args(parser, True)
-    return parser.parse_args(flags)
+from robots.robodojo.vpp2_client import VPP2Client
+from tests.unit_tests.robots.robodojo.fakes import args, metadata
 
 
 def test_awomo_requires_exactly_one_endpoint_and_native_joint_robot():
@@ -130,7 +105,15 @@ def test_native_payload_keeps_camera_colors_and_named_joint_order():
     image = np.array([[[255, 17, 3]]], dtype=np.uint8)
     obs = {
         "state": state,
-        "vision": {camera: {"color": image.copy()} for camera in CAMERAS},
+        "vision": {
+            camera: {
+                "color": image.copy(),
+                "depth": np.ones((1, 1)),
+                "intrinsic_matrix": np.eye(3),
+                "extrinsic_matrix": np.eye(4),
+            }
+            for camera in CAMERAS
+        },
         "instruction": "stack blocks",
     }
     actions = [state]
@@ -141,7 +124,15 @@ def test_native_payload_keeps_camera_colors_and_named_joint_order():
 
     client = Awomo05Client(SimpleNamespace(call=call))
     client.update_obs(obs, 0)
-    assert calls[-1][1]["args"][0] is obs
+    sent = calls[-1][1]["args"][0]
+    assert sent["instruction"] == obs["instruction"]
+    assert all(sent["state"][key] is state[key] for key in STATE_FIELDS)
+    assert all(
+        sent["vision"][name]["color"] is obs["vision"][name]["color"]
+        for name in CAMERAS
+    )
+    assert all(set(camera) == {"color"} for camera in sent["vision"].values())
+    assert all("depth" in camera for camera in obs["vision"].values())
     np.testing.assert_array_equal(obs["vision"][CAMERAS[0]]["color"], image)
     assert client.get_action() is actions
     obs["vision"].pop(CAMERAS[-1])
@@ -170,7 +161,6 @@ def test_invalid_native_actions_are_rejected(actions):
 def test_standalone_wrapper_delegates_without_action_or_history_cache():
     events = []
     native = SimpleNamespace(
-        run_cfg=SimpleNamespace(data=SimpleNamespace(train={"history": {"fps": 25}})),
         env_cfg_type="arx_x5",
         action_type="joint",
         expected_action_dim=14,
@@ -183,21 +173,22 @@ def test_standalone_wrapper_delegates_without_action_or_history_cache():
         update_obs=lambda obs: events.append(obs),
         get_action=lambda: events.append("get_action"),
     )
-    wrapped = ModelWithMetadata(native, {})
+    wrapped = ModelWithMetadata(native, history_fps=25)
     validate_model_meta(wrapped.get_model_meta())
     assert not events
     wrapped.reset()
     wrapped.update_obs({"frame": 0})
     wrapped.get_action()
     assert events == ["reset", {"frame": 0}, "get_action"]
-    with pytest.raises(ValueError, match="25 Hz"):
-        ModelWithMetadata(native, {"history_fps": 10})
+    with pytest.raises(ValueError, match="control_hz"):
+        ModelWithMetadata(native, history_fps=10)
 
 
+@pytest.mark.parametrize("interrupted", [False, True])
 def test_owned_bridge_uses_selected_interpreter_and_preserves_borrowed_service(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, interrupted
 ):
-    from robots.robodojo import awomo05
+    from robots.robodojo import awomo05_bridge
 
     root = tmp_path / "XPolicyLab"
     module = root / "client_server/ws/model_client.py"
@@ -213,8 +204,13 @@ def test_owned_bridge_uses_selected_interpreter_and_preserves_borrowed_service(
 
         def start(self):
             recorded["started"] = True
+            if interrupted:
+                raise KeyboardInterrupt
 
-    monkeypatch.setattr(awomo05, "ProcessDaemon", Daemon)
+        def stop(self):
+            recorded["stopped"] = True
+
+    monkeypatch.setattr(awomo05_bridge, "ProcessDaemon", Daemon)
     config = args(
         "--vla-backend",
         "awomo05",
@@ -225,6 +221,11 @@ def test_owned_bridge_uses_selected_interpreter_and_preserves_borrowed_service(
         "--policy-python",
         str(interpreter),
     )
+    if interrupted:
+        with pytest.raises(KeyboardInterrupt):
+            robot_spec._spawn_awomo_server(config, tmp_path)
+        assert recorded["stopped"]
+        return
     daemon, rpc = robot_spec._spawn_awomo_server(config, tmp_path)
     try:
         assert recorded["started"]
@@ -237,112 +238,238 @@ def test_owned_bridge_uses_selected_interpreter_and_preserves_borrowed_service(
         rpc.close()
 
 
-def test_bridge_checks_upstream_without_state_mutation_and_releases_transport(
-    monkeypatch,
+@pytest.mark.parametrize("compatible", [True, False])
+def test_bridge_metadata_check_releases_transport_without_mutation(
+    monkeypatch, compatible
 ):
     from robots.robodojo.awomo05_bridge import Awomo05Facade
-    from rpent.robots.components import xpolicylab_vla_server as shared
+    from rpent.robots.components.xpolicylab_vla_server import add_connection_args
 
-    calls = []
-    closed = []
+    calls, closed = [], []
 
     def call(func_name):
         calls.append(func_name)
-        return metadata()
+        return {**metadata(), "policy_name": "Awomo05" if compatible else "Pi_05"}
 
     model = SimpleNamespace(call=call, close=lambda: closed.append(True))
     monkeypatch.setattr(Awomo05Facade, "_connect_policy", lambda *args: model)
     parser = argparse.ArgumentParser()
-    shared.add_backend_args(parser)
-    facade = Awomo05Facade(
-        parser.parse_args(["--task", "stack", "--policy-server-url", "ws://model"])
-    )
-    try:
-        validate_model_meta(facade.get_model_meta(), bridge=True)
-        assert calls == ["get_model_meta"]
-        assert set(SESSION_METHODS).issubset(facade._rpc)
-    finally:
-        facade.close()
+    add_connection_args(parser, required=True)
+    config = parser.parse_args(["--task", "stack", "--policy-server-url", "ws://model"])
+    if compatible:
+        facade = Awomo05Facade(config)
+        try:
+            validate_model_meta(facade.get_model_meta(), bridge=True)
+        finally:
+            facade.close()
+            facade.close()
+    else:
+        with pytest.raises(ValueError, match="policy_name"):
+            Awomo05Facade(config)
+    assert calls == ["get_model_meta"]
     assert closed == [True]
 
 
-def test_rejected_upstream_closes_bridge_without_reset(monkeypatch):
-    from robots.robodojo.awomo05_bridge import Awomo05Facade
-    from rpent.robots.components import xpolicylab_vla_server as shared
+@pytest.mark.parametrize(
+    "failure", [None, RuntimeError("serve failed"), SystemExit(143)]
+)
+def test_bridge_cli_closes_connection_and_restores_signal_handler(monkeypatch, failure):
+    import signal
+    import sys
+
+    from robots.robodojo import awomo05_bridge
 
     closed = []
-
-    def call(func_name):
-        assert func_name == "get_model_meta"
-        return {**metadata(), "policy_name": "Pi_05"}
-
-    monkeypatch.setattr(
-        Awomo05Facade,
-        "_connect_policy",
-        lambda *args: SimpleNamespace(call=call, close=lambda: closed.append(True)),
+    model = SimpleNamespace(
+        call=lambda **kwargs: metadata(), close=lambda: closed.append(True)
     )
-    parser = argparse.ArgumentParser()
-    shared.add_backend_args(parser)
-    with pytest.raises(ValueError, match="policy_name"):
-        Awomo05Facade(
-            parser.parse_args(["--task", "stack", "--policy-server-url", "ws://model"])
-        )
+    monkeypatch.setattr(
+        awomo05_bridge.Awomo05Facade, "_connect_policy", lambda *args: model
+    )
+
+    def serve(self, **kwargs):
+        assert kwargs == {
+            "transport": "http",
+            "host": "127.0.0.1",
+            "port": 9205,
+            "parent_watch": True,
+            "session_sweep_s": 60.0,
+        }
+        if failure is not None:
+            raise failure
+
+    monkeypatch.setattr(awomo05_bridge.Awomo05Facade, "serve", serve)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "bridge",
+            "--task",
+            "pick",
+            "--policy-server-url",
+            "ws://model",
+            "--port",
+            "9205",
+            "--parent-watch",
+        ],
+    )
+    previous = signal.getsignal(signal.SIGTERM)
+    if failure is None:
+        awomo05_bridge.main()
+    else:
+        with pytest.raises(type(failure)) as caught:
+            awomo05_bridge.main()
+        assert caught.value is failure
+    assert signal.getsignal(signal.SIGTERM) is previous
     assert closed == [True]
 
 
-def test_runtime_validates_awomo_before_resetting_borrowed_environment(
-    monkeypatch, tmp_path
-):
+@pytest.fixture
+def runtime_services(monkeypatch):
+    from robots.robodojo import env_client, vpp2_server
+
     events = []
+    failure = {}
+
+    def fail(phase):
+        if failure.get("phase") == phase:
+            raise failure["error"]
+
+    def spawn(name, config):
+        events.append(("spawn", name))
+        if name == "vla":
+            fail("spawn")
+
+        def call(method, **kwargs):
+            events.append((method, name))
+            if method == "vla.get_model_meta":
+                return metadata()
+            assert method == "healthz"
+            return {"status": "ok"}
+
+        rpc = SimpleNamespace(call=call, close=lambda: events.append(("close", name)))
+        # The environment is owned, while the model service is borrowed.
+        daemon = (
+            SimpleNamespace(
+                name=name, poll=lambda: None, stop=lambda: events.append(("stop", name))
+            )
+            if name == "env"
+            else None
+        )
+        return daemon, rpc
+
+    for component, suffix in (
+        ("env", "env"),
+        ("sam3", "sam3"),
+        ("vla", "awomo"),
+        ("vla", "vpp2"),
+    ):
+        monkeypatch.setattr(
+            robot_spec,
+            f"_spawn_{suffix}_server",
+            lambda config, output, name=component: spawn(name, config),
+        )
+
+    def environment(rpc, **kwargs):
+        events.append(("connect", "env"))
+        return rpc
+
+    monkeypatch.setattr(env_client, "RoboDojoEnvClient", environment)
+    original = robot_spec._connect_awomo
+
+    def connect(rpc):
+        fail("connect")
+        return original(rpc)
+
+    monkeypatch.setattr(robot_spec, "_connect_awomo", connect)
+    from robots.robodojo import vpp2_client
+
+    original_vpp2 = vpp2_client.VPP2Client
+
+    def connect_vpp2(rpc):
+        fail("connect")
+        return original_vpp2(rpc)
+
+    monkeypatch.setattr(vpp2_client, "VPP2Client", connect_vpp2)
+    monkeypatch.setattr(
+        vpp2_server,
+        "model_paths",
+        lambda *args: pytest.fail("unexpected VPP2 weight lookup"),
+    )
+    return events, failure
+
+
+@pytest.mark.parametrize(
+    "backend,flags,components,expected",
+    [
+        ("vpp2", [], None, {"env", "vla", "sam3"}),
+        ("awomo05", [], None, {"env", "vla"}),
+        (
+            "awomo05",
+            ["--vla-agent", "--agent-tools", "policy", "sam3"],
+            None,
+            {"env", "vla", "sam3"},
+        ),
+        ("awomo05", [], {"sam3"}, {"sam3"}),
+        ("awomo05", [], {"vla"}, {"vla"}),
+    ],
+)
+def test_runtime_selects_services_and_backend(
+    runtime_services, tmp_path, backend, flags, components, expected
+):
+    from rpent.dashboard.events import NullDashboardEventSink
+
+    events, _ = runtime_services
     config = args(
         "--vla-backend",
-        "awomo05",
+        backend,
         "--vla-endpoint",
         "http://bridge",
-        "--env-endpoint",
-        "http://env",
-    )
-    monkeypatch.setattr(
-        robot_spec, "try_spawn_server", lambda owned, sink, name, starter: (None, name)
-    )
-
-    def wait(owned, sink, name, rpc, daemon, timeout, post_fn):
-        events.append(name)
-        raise ValueError("incompatible model")
-
-    monkeypatch.setattr(robot_spec, "try_wait_server", wait)
-    with pytest.raises(ValueError, match="incompatible model"):
-        robot_spec._init_runtime(config, tmp_path, None, {"env", "vla"})
-    assert events == ["vla"]
-
-
-def test_awomo_websocket_runtime_never_checks_vpp2_weights(monkeypatch, tmp_path):
-    from robots.robodojo import vpp2_server
-
-    started = []
-
-    def forbidden(*args):
-        raise AssertionError("Awomo must not check VPP2 resources")
-
-    monkeypatch.setattr(vpp2_server, "model_paths", forbidden)
-    monkeypatch.setattr(
-        robot_spec,
-        "try_spawn_server",
-        lambda owned, sink, name, starter: (started.append(name), name),
-    )
-    monkeypatch.setattr(robot_spec, "try_wait_server", lambda *a, **kw: {})
-    config = args(
-        "--vla-backend",
-        "awomo05",
-        "--policy-server-url",
-        "ws://model",
         "--vla-model-path",
         "/missing/vpp2",
+        *flags,
     )
-    _, kwargs = robot_spec._init_runtime(config, tmp_path, None, None)
-    assert set(started) == {"env", "vla"}
-    assert kwargs["vla_backend"] == "awomo05"
-    assert not kwargs["vla_agent"]
+    owned, kwargs = robot_spec._init_runtime(
+        config, tmp_path, NullDashboardEventSink(), components
+    )
+    assert {name for phase, name in events if phase == "spawn"} == expected
+    assert len(owned) == int("env" in expected)
+    if "vla" in expected:
+        assert isinstance(
+            kwargs["vla_client"], Awomo05Client if backend == "awomo05" else VPP2Client
+        )
+    if backend == "awomo05" and {"env", "vla"} <= expected:
+        assert events.index(("vla.get_model_meta", "vla")) < events.index(
+            ("connect", "env")
+        )
+
+
+@pytest.mark.parametrize("backend", ["vpp2", "awomo05"])
+@pytest.mark.parametrize("phase", ["spawn", "connect"])
+@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt, SystemExit])
+def test_runtime_failure_cleans_owned_processes_and_pending_connections(
+    runtime_services, tmp_path, backend, phase, error_type
+):
+    from rpent.dashboard.events import NullDashboardEventSink
+
+    events, failure = runtime_services
+    error = error_type("interrupted startup")
+    failure.update(phase=phase, error=error)
+    config = args("--vla-backend", backend, "--vla-endpoint", "http://bridge")
+    with pytest.raises(
+        RuntimeError if error_type is ValueError else error_type
+    ) as caught:
+        robot_spec._init_runtime(
+            config, tmp_path, NullDashboardEventSink(), {"env", "vla"}
+        )
+    if error_type is not ValueError:
+        assert caught.value is error
+    assert [(op, name) for op, name in events if op == "stop"] == [("stop", "env")]
+    assert {name for op, name in events if op == "close"} == (
+        {"env"} if phase == "spawn" else {"env", "vla"}
+    )
+    if backend == "awomo05" and phase == "connect":
+        assert ("connect", "env") not in events
 
 
 def test_borrowed_awomo_rpc_uses_shared_session_transport(monkeypatch, tmp_path):
@@ -358,29 +485,77 @@ def test_borrowed_awomo_rpc_uses_shared_session_transport(monkeypatch, tmp_path)
     assert called == [("socket://bridge:1234", {"enable_sessions": True})]
 
 
-def test_backend_connectors_follow_vla_selection(monkeypatch, tmp_path):
-    from robots.robodojo import vpp2_client
+def test_optional_action_info_preserves_public_action_list_without_second_rpc():
+    actions = [
+        {
+            key: np.zeros(width)
+            for key, width in {
+                "left_arm_joint_state": 6,
+                "right_arm_joint_state": 6,
+                "left_ee_joint_state": 1,
+                "right_ee_joint_state": 1,
+            }.items()
+        }
+    ]
+    calls = []
+    info = {"upstream": {"latency_ms": 12.5}, "model": {"custom": {"x": 1}}}
 
-    monkeypatch.setattr(
-        robot_spec, "try_spawn_server", lambda owned, sink, name, starter: (None, name)
+    def call(method, **kwargs):
+        calls.append((method, kwargs))
+        if method == "vla.get_model_meta":
+            return {**metadata(), "action_info": True}
+        assert kwargs["kwargs"] == {"include_info": True}
+        return {"actions": actions, "info": info}
+
+    client = Awomo05Client(SimpleNamespace(call=call))
+    assert client.get_action() is actions
+    assert client.last_action_info is info
+    assert len(calls) == 2
+
+
+def test_bridge_envelope_is_optional_and_never_repeats_inference(monkeypatch):
+
+    from robots.robodojo.awomo05_bridge import Awomo05Facade
+    from rpent.robots.components import xpolicylab_vla_server as shared
+
+    calls = []
+    actions = [{"joint": [1, 2]}]
+    upstream = {"ok": True, "latency_ms": 987.25, "future_metric": 17}
+    result = {"actions": actions, "model_stats": {"decode_s": 0.5}}
+
+    def connect(self, url, args):
+        self._observed_client = SimpleNamespace(call_info=upstream)
+
+        def call(func_name, obs=None):
+            calls.append(func_name)
+            if func_name == "get_model_meta":
+                return metadata()
+            if func_name == "get_action":
+                return result
+
+        return SimpleNamespace(call=call, close=lambda: None)
+
+    monkeypatch.setattr(Awomo05Facade, "_connect_policy", connect)
+    parser = argparse.ArgumentParser()
+    shared.add_backend_args(parser)
+    facade = Awomo05Facade(
+        parser.parse_args(["--task", "stack", "--policy-server-url", "ws://test"])
     )
-    monkeypatch.setattr(
-        robot_spec, "try_wait_server", lambda *a, post_fn, **kw: post_fn()
-    )
-    monkeypatch.setattr(robot_spec, "_connect_awomo", lambda rpc: ("awomo05", rpc))
-    monkeypatch.setattr(vpp2_client, "VPP2Client", lambda rpc: ("vpp2", rpc))
-    for backend in ("vpp2", "awomo05"):
-        config = args("--vla-backend", backend, "--vla-endpoint", "http://bridge")
-        _, kwargs = robot_spec._init_runtime(config, tmp_path, None, {"vla"})
-        assert kwargs["vla_client"] == (backend, "vla")
-
-
-def test_default_prompt_keeps_vpp2_and_awomo_prompt_excludes_it():
-    from robots.robodojo.prompt_bundle import system_prompt, user_prompt
-
-    assert "vpp2_act" in str(system_prompt())
-    for agent in (False, True):
-        variables = {"vla_backend": "awomo05", "vla_agent": agent}
-        assert "vpp2_act" not in str(system_prompt(variables))
-        assert "VPP2" not in str(user_prompt(variables))
-        assert "run_policy" in str(system_prompt(variables))
+    try:
+        facade.reset_session(session_id="owner")
+        facade.update_obs({}, 0, session_id="owner")
+        with pytest.raises(ValueError):
+            facade.get_action(session_id="owner", include_info="yes")
+        envelope = facade.get_action(session_id="owner", include_info=True)
+        assert envelope["actions"] is actions
+        assert envelope["info"]["upstream"] == upstream
+        assert envelope["info"]["model"] == {"model_stats": {"decode_s": 0.5}}
+        assert envelope["info"]["bridge_rpc_s"] >= 0
+        with pytest.raises(RuntimeError, match="new observation"):
+            facade.get_action(session_id="owner", include_info=True)
+        assert calls.count("get_action") == 1
+        facade.update_obs({}, 1, session_id="owner")
+        assert facade.get_action(session_id="owner") is actions
+        assert calls.count("get_action") == 2
+    finally:
+        facade.close()

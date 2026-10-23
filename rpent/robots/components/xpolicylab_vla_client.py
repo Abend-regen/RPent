@@ -47,9 +47,17 @@ class XPolicyLabVLAClient(BaseVLAClient):
             timeout_s=self._TIMEOUT_S["predict"],
         )
 
-    def get_action(self) -> Any:
-        """Infer an action chunk from the most recently buffered observation."""
-        return self._client.call("vla.get_action", timeout_s=self._TIMEOUT_S["predict"])
+    def get_action(self, *, include_info: bool = False) -> Any:
+        """Infer once, optionally retaining the backend's result envelope."""
+        return self._client.call(
+            "vla.get_action",
+            **(
+                {"kwargs": {"include_info": include_info}}
+                if include_info is not False
+                else {}
+            ),
+            timeout_s=self._TIMEOUT_S["predict"],
+        )
 
     def close(self) -> None:
         """Release this client's RPC session."""

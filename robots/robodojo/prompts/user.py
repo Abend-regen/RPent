@@ -20,7 +20,6 @@ TASK = """- task:   {{task}}
 - seed group: {{seed}}
 - layout: {{layout}}
 - env_cfg: {{env_cfg_type}}
-- control: analytic joint targets and VPP2 native EE16 targets
 - output_dir: {{output_dir}}
 - scene (static hint): {{task_summary}}"""
 
@@ -30,4 +29,9 @@ inspect execution feedback, and record the outcome before finishing."""
 
 
 POLICY_BEGIN = """Read the original task instruction with `view_env_state`, then
-execute `run_policy` until the environment ends the episode or an error occurs."""
+choose bounded `run_policy` calls and inspect their feedback until the episode
+ends or execution is interrupted. Report the observed outcome with `finish`."""
+
+MIXED_BEGIN = """Read `view_env_state` for the original task and current images.
+Plan from the observation, act through the configured tools, and check their
+actual effects."""

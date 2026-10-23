@@ -150,8 +150,8 @@ def get_robot_spec() -> RobotSpec:
         init_runtime=_init_runtime,
         dashboard=ROBODOJO_DASHBOARD_SPEC,
         validate_args=_validate_args,
-        prepare_memory=_prepare_memory,
         finalize_run=finalize_run,
+        default_runtime_components=_default_runtime_components,
     )
 
 
@@ -211,14 +211,6 @@ def _validate_args(args: argparse.Namespace) -> None:
     if getattr(args, "vla_agent", False):
         if backend != "awomo05":
             raise ValueError("--vla-agent requires --vla-backend awomo05")
-        if args.agent_max_calls < 1 or args.agent_timeout_s < 1:
-            raise ValueError("Agent budgets must be positive")
-        if (
-            getattr(args, "explore", False)
-            or getattr(args, "memory_repo", None)
-            or getattr(args, "memory_dir", None)
-        ):
-            raise ValueError("VLA Agent uses a fresh run without historical memory")
         if getattr(args, "planner", None) == "claude_code":
             raise ValueError("VLA Agent currently supports api and codex planners")
 
@@ -347,17 +339,15 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
     parser.add_argument(
         "--vla-agent",
         action="store_true",
-        help="Enable stage planning and mixed Awomo/primitive control",
+        help="Enable mixed Awomo policy, motion and perception tools",
     )
     parser.add_argument(
         "--agent-tools",
         nargs="+",
         choices=("policy", "motion", "geometry", "sam3"),
         default=["policy", "motion", "geometry"],
-        help="Enabled collaboration tool groups",
+        help="Tool groups available in mixed control mode",
     )
-    parser.add_argument("--agent-max-calls", type=int, default=120)
-    parser.add_argument("--agent-timeout-s", type=int, default=1800)
     parser.add_argument(
         "--sam3-endpoint",
         default=None,
@@ -616,13 +606,23 @@ def _spawn_vpp2_server(
     return daemon, make_rpc_client(f"socket://{host}:{port}")
 
 
+def _default_runtime_components(args: argparse.Namespace) -> set[str]:
+    """Select services needed by the configured backend and tool groups."""
+    selected = {"env", "vla"}
+    if args.vla_backend == "vpp2" or (
+        getattr(args, "vla_agent", False) and "sam3" in args.agent_tools
+    ):
+        selected.add("sam3")
+    return selected
+
+
 def _init_runtime(
     args: argparse.Namespace,
     output_dir: Path,
     dashboard_events: DashboardEventSink,
     components: set[str] | None,
 ) -> tuple[list[ProcessDaemon], dict[str, Any]]:
-    """Start Env, SAM3 and VPP2, or only the requested Dashboard components."""
+    """Start default backend services or an explicitly requested component set."""
     _validate_args(args)
     from robots.robodojo.env_client import RoboDojoEnvClient
     from robots.robodojo.vpp2_client import VPP2Client
@@ -672,11 +672,9 @@ def _init_runtime(
         if args.vla_backend == "awomo05"
         else ("env", "sam3", "vla")
     )
-    selected = {"env", "sam3", "vla"} if components is None else set(components)
-    if components is None and args.vla_backend == "awomo05":
-        selected = {"env", "vla"}
-        if getattr(args, "vla_agent", False) and "sam3" in args.agent_tools:
-            selected.add("sam3")
+    selected = (
+        _default_runtime_components(args) if components is None else set(components)
+    )
     unknown = selected.difference(starters)
     if unknown:
         raise ValueError(f"unknown RoboDojo runtime components: {sorted(unknown)}")
@@ -722,29 +720,15 @@ def _init_runtime(
         vla_backend=args.vla_backend,
         vla_agent=getattr(args, "vla_agent", False),
         agent_tools=getattr(args, "agent_tools", ["policy", "motion", "geometry"]),
-        agent_max_calls=getattr(args, "agent_max_calls", 120),
-        agent_timeout_s=getattr(args, "agent_timeout_s", 1800),
     )
     return list(owned_daemons.values()), primitives_kwargs
-
-
-def _prepare_memory(args: argparse.Namespace, config: RunConfig) -> None:
-    """Give collaboration a fresh memory root; delegate ordinary runs unchanged."""
-    if getattr(args, "vla_agent", False):
-        config.prompt_vars["memory_dir"] = str(config.output_dir / "agent-memory")
-        return
-    from dataclasses import replace
-
-    from rpent.memory.loading import prepare_run_memory
-
-    prepare_run_memory(args, replace(get_robot_spec(), prepare_memory=None), config)
 
 
 def _spawn_awomo_server(args: argparse.Namespace, output_dir: Path):
     """Borrow RPent RPC or own only a bridge to the borrowed upstream model."""
     if args.vla_endpoint:
         return None, make_rpc_client(args.vla_endpoint, enable_sessions=True)
-    from robots.robodojo.awomo05 import spawn_bridge
+    from robots.robodojo.awomo05_bridge import spawn_bridge
 
     return spawn_bridge(args, output_dir)
 

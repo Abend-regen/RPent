@@ -388,7 +388,10 @@ def test_segmentation_failure_keeps_manual_localization_available(toolkit_factor
     reads = env.reads
     result = toolkit.execute_tool("segment", {"text_prompt": "bottle"})
     assert result.is_error and "SAM3 unavailable" in result.data["error"]
-    assert "back_project" in result.data["fallback"]
+    assert (
+        result.data["fallback"]
+        == "Inspect another saved view or revise the description; use only available tools."
+    )
     assert not toolkit.execute_tool("back_project", {"row": 1, "col": 1}).is_error
     assert env.reads == reads
 
@@ -408,7 +411,10 @@ def test_segmentation_no_mask_explains_manual_fallback(toolkit_factory):
     assert response.data["found"] is False
     assert response.data["score"] == 0.1
     assert response.data["reason"] == "score below threshold"
-    assert "back_project" in response.data["fallback"]
+    assert (
+        response.data["fallback"]
+        == "Inspect another saved view or revise the description; use only available tools."
+    )
     assert not response.images
 
 

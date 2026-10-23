@@ -284,6 +284,8 @@ class RoboDojoEnvClient(BaseEnvClient):
             if monitor is not None:
                 self.require_policy_ready()
                 if source != "policy":
+                    # Preflight delivery must succeed before mutation. Actual
+                    # takeover is established by the following action receipt.
                     monitor.notify("actions_invalidated", reason=source)
                 kwargs = {**kwargs, "expected_step": monitor.step}
             was_valid, self._history_valid = self._history_valid, False
@@ -361,7 +363,7 @@ class RoboDojoEnvClient(BaseEnvClient):
         return self._call_action("env.hold_step", kwargs={}, source="hold")
 
     def get_execution_state(self) -> dict[str, Any]:
-        """Read confirmed collaboration progress without an RPC or model update."""
+        """Read confirmed execution progress without an RPC or model update."""
         with self._execution_lock:
             monitor = self._execution
             if monitor is None:

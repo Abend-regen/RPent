@@ -17,20 +17,25 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from robots.robodojo.awomo05_contract import SESSION_METHODS, validate_model_meta
 from rpent.robots.components.xpolicylab_vla_server import (
     XPolicyLabVLAFacade,
-    add_backend_args,
+    add_connection_args,
 )
+from rpent.utils.config import get_repo_root
+from rpent.utils.daemon import ProcessDaemon, pick_free_port
+from rpent.utils.rpc.http_rpc import HttpRpcClient
 
 
 class Awomo05Facade(XPolicyLabVLAFacade):
-    """Reuse the phase-one session protocol and validate upstream capabilities."""
+    """Adapt the shared session protocol to the official Awomo05 service."""
 
     def __init__(self, args: argparse.Namespace) -> None:
         if not args.policy_server_url:
@@ -113,9 +118,64 @@ class Awomo05Facade(XPolicyLabVLAFacade):
         }
 
 
+def spawn_bridge(
+    args: argparse.Namespace, output_dir: Path
+) -> tuple[ProcessDaemon, HttpRpcClient]:
+    """Start only the CPU bridge, borrowing an independently managed model server."""
+    interpreter = Path(args.pi05_python).expanduser()
+    if not interpreter.is_file():
+        raise ValueError(f"Policy bridge Python not found: {interpreter}")
+    root = (
+        Path(args.xpolicylab_root).expanduser()
+        if args.xpolicylab_root
+        else (
+            Path(args.source_root).expanduser() / "XPolicyLab"
+            if args.source_root
+            else None
+        )
+    )
+    if root is None or not (root / "client_server/ws/model_client.py").is_file():
+        raise ValueError(
+            "Awomo05 WebSocket connection requires --xpolicylab-root or --source-root"
+        )
+    root = root.resolve()
+    host, port = "127.0.0.1", pick_free_port()
+    daemon = ProcessDaemon(
+        name="robodojo_awomo05_bridge",
+        cmd=[
+            str(interpreter),
+            "-u",
+            "-m",
+            "robots.robodojo.awomo05_bridge",
+            "--task",
+            args.task,
+            "--policy-server-url",
+            args.policy_server_url,
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--parent-watch",
+        ],
+        env_overrides={
+            "PYTHONPATH": os.pathsep.join(
+                [str(get_repo_root()), str(root.parent), str(root)]
+                + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])
+            )
+        },
+        log_path=str(output_dir / "awomo05_bridge.log"),
+    )
+    try:
+        daemon.start()
+    except BaseException:
+        daemon.stop()
+        raise
+    return daemon, HttpRpcClient(f"http://{host}:{port}", enable_sessions=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_backend_args(parser)
+    add_connection_args(parser, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--parent-watch", action="store_true")
@@ -136,9 +196,11 @@ def main() -> None:
             session_sweep_s=60.0,
         )
     finally:
-        if facade is not None:
-            facade.close()
-        signal.signal(signal.SIGTERM, previous)
+        try:
+            if facade is not None:
+                facade.close()
+        finally:
+            signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":

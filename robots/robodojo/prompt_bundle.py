@@ -27,20 +27,29 @@ def system_prompt(
     variables: Mapping[str, object] | None = None,
 ) -> PromptNode:
     if (variables or {}).get("vla_agent"):
-        from robots.robodojo.prompts.collaboration import VLA_COLLABORATION
-
-        return {
-            "VLA COLLABORATION": VLA_COLLABORATION,
-            "ROBOT": system_parts.ROLE_AND_RULES,
+        groups = set(variables.get("agent_tools", ("policy", "motion", "geometry")))
+        sections = {
+            "ROLE AND RULES": system_parts.ROLE_AND_RULES,
             "OBSERVATIONS": system_parts.TOOL_ACCESS,
-            "PERCEPTION": system_parts.PERCEPTION,
-            "ROBOT TOOLS": system_parts.TOOLS.split("\nvpp2_act(", 1)[0],
-            "GEOMETRY LIMITS": system_parts.SAFETY,
-            "CONFIGURATION": "Enabled tool groups: {{agent_tools}}. Only registered tools are available.",
+            "MIXED CONTROL": system_parts.AWOMO_MIXED_CONTROL,
+            "EXECUTION FEEDBACK": system_parts.AWOMO_FEEDBACK,
+            "MEMORY": system_parts.AWOMO_MEMORY,
         }
+        if "policy" in groups:
+            sections["POLICY"] = system_parts.AWOMO_POLICY_TOOL
+        if "motion" in groups:
+            sections["MOTION"] = system_parts.MOTION_TOOLS
+            sections["GEOMETRY LIMITS"] = system_parts.SAFETY
+        if "geometry" in groups:
+            sections["GEOMETRY"] = system_parts.AWOMO_GEOMETRY
+        if "sam3" in groups:
+            sections["SEGMENTATION"] = system_parts.AWOMO_SEGMENTATION
+        return sections
     if (variables or {}).get("vla_backend") == "awomo05":
         return {
             "POLICY EXECUTION": system_parts.AWOMO_POLICY,
+            "POLICY": system_parts.AWOMO_POLICY_TOOL,
+            "EXECUTION FEEDBACK": system_parts.AWOMO_FEEDBACK,
             "REWARD AND SCORE": system_parts.REWARD,
             "OUTPUT DISCIPLINE": system_parts.OUTPUT_DISCIPLINE,
         }
@@ -48,7 +57,9 @@ def system_prompt(
         "ROLE AND RULES": system_parts.ROLE_AND_RULES,
         "TOOL ACCESS": system_parts.TOOL_ACCESS,
         "PERCEPTION": system_parts.PERCEPTION,
-        "AVAILABLE OPERATIONS": system_parts.TOOLS,
+        "AVAILABLE OPERATIONS": system_parts.MOTION_TOOLS
+        + "\n\n"
+        + system_parts.VPP2_POLICY,
         "OBSERVE AND ACT": system_parts.ACTION_LOOP,
         "SAFETY": system_parts.SAFETY,
         "REWARD AND SCORE": system_parts.REWARD,
@@ -68,15 +79,10 @@ def user_prompt(
     variables: Mapping[str, object] | None = None,
 ) -> PromptNode:
     if (variables or {}).get("vla_agent"):
-        return {
-            "BEGIN": "Read view_env_state for the original task and current images, create a stage plan, then solve through the configured tools."
-        }
+        return {"BEGIN": user_parts.MIXED_BEGIN}
     if (variables or {}).get("vla_backend") == "awomo05":
         return {
-            "TASK": user_parts.TASK.replace(
-                "analytic joint targets and VPP2 native EE16 targets",
-                "Awomo05 native joint policy",
-            ),
+            "TASK": user_parts.TASK,
             "BEGIN": user_parts.POLICY_BEGIN,
         }
     sections = {

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -66,15 +67,11 @@ class RoboDojoToolkit(Toolkit):
         state_output_dir: Path | str | None = None,
     ) -> None:
         self.eval_fair = eval_fair
-        self._agent = None
-        self._finalizing = False
         self.vla_agent = primitives_kwargs.get("vla_agent", False)
         self.registered_tools_only = self.vla_agent
         self._stateful_policy = (
             primitives_kwargs.get("vla_backend", "vpp2") == "awomo05"
         )
-        self._resume_chunks = primitives_kwargs.get("vla_backend") == "awomo05"
-        self._policy_only = self._resume_chunks and not self.vla_agent
         if self.vla_agent and not self._stateful_policy:
             raise ValueError("VLA Agent requires a stateful policy backend")
         if self._stateful_policy and eval_fair:
@@ -87,40 +84,40 @@ class RoboDojoToolkit(Toolkit):
             state=state,
             memory=memory,
         )
+        names = self._tool_names(primitives_kwargs)
         self.init_primitives(primitives_kwargs=primitives_kwargs)
-        self._register_robodojo_tools()
-        if self.vla_agent:
-            try:
-                self._configure_agent(primitives_kwargs, state_output_dir)
-            except Exception:
+        try:
+            self._register_robodojo_tools(names)
+            if self.vla_agent:
+                self._configure_memory_tools()
+            self._publish_step(self._dump_state())
+        except Exception:
+            if self._stateful_policy:
                 self._primitives.env.release()
-                raise
-        if eval_fair:
-            allowed = OBSERVATION_TOOLS | MOTION_TOOLS | {"finish", "render"}
-            self._tools = {
-                name: entry for name, entry in self._tools.items() if name in allowed
-            }
+            raise
 
-    def execute_tool(self, name, input_dict):
-        if self._agent is not None:
-            try:
-                return self._agent.dispatch(
-                    name,
-                    input_dict,
-                    self._execute_registered,
-                    mutating=name in MOTION_TOOLS | {"run_policy"},
-                )
-            except Exception as exc:
-                # The action may already have completed when journal/feedback
-                # delivery fails. Preserve confirmed progress and fail closed.
-                self._primitives.env.invalidate_execution(str(exc))
-                return ToolResult(
-                    data={
-                        "error": str(exc),
-                        **self._primitives.env.get_execution_state(),
-                    }
-                )
-        return self._execute_registered(name, input_dict)
+    def _tool_names(self, kwargs) -> set[str]:
+        if self.vla_agent:
+            groups = set(kwargs.get("agent_tools", ("policy", "motion", "geometry")))
+            choices = {
+                "policy": {"run_policy"},
+                "motion": MOTION_TOOLS - {"vpp2_act"},
+                "geometry": {"back_project", "sample_world_xyz", "query_world_map"},
+                "sam3": {"segment"},
+            }
+            if not groups or groups - choices.keys():
+                raise ValueError("Unknown or empty Agent tool groups")
+            if "sam3" in groups and kwargs.get("sam3_client") is None:
+                raise ValueError("The sam3 tool group requires a SAM3 service")
+            return {"view_env_state", "render", "finish"}.union(
+                *(choices[g] for g in groups)
+            )
+        if self._stateful_policy:
+            return {"view_env_state", "run_policy", "finish"}
+        names = OBSERVATION_TOOLS | MOTION_TOOLS | {"finish", "render"}
+        return set(
+            names if kwargs.get("vla_client") is not None else names - {"vpp2_act"}
+        )
 
     def flash_observation(self) -> dict:
         """Refresh the public observation used by live Flash grounding."""
@@ -134,22 +131,18 @@ class RoboDojoToolkit(Toolkit):
 
     def init_primitives(self, *, primitives_kwargs: dict[str, Any]) -> None:
         """Start a new trace from the runtime-owned environment."""
-        from robots.robodojo import tools as robodojo_tools
-
         self._pending_perception = []
         env = primitives_kwargs["env"]
         policy = primitives_kwargs.get("vla_client")
         if self._stateful_policy:
-            from robots.robodojo.policy_adapter import RoboDojoPolicyAdapter
             from robots.robodojo.stateful_policy import StatefulPolicyEnv
 
             if policy is None:
                 raise ValueError("Stateful policy execution requires a VLA client")
             env = StatefulPolicyEnv(
                 env,
-                RoboDojoPolicyAdapter(policy, stateful=True),
+                policy,
                 self.raise_if_cancelled,
-                resume_chunks=self._resume_chunks,
             )
         self._state.reset()
         self._primitives = RoboDojoPrimitives(
@@ -161,15 +154,6 @@ class RoboDojoToolkit(Toolkit):
             action_type=primitives_kwargs.get("action_type", "joint"),
             check_cancelled=self.raise_if_cancelled,
         )
-        self._primitives.require_rgbd = self.vla_agent
-        try:
-            self._publish_step(
-                robodojo_tools.dump_state(self._primitives, self._state, log=None)
-            )
-        except Exception:
-            if self._stateful_policy:
-                env.release()
-            raise
 
     def solved(self) -> bool:
         """Read official success for the runner after planner execution."""
@@ -177,13 +161,16 @@ class RoboDojoToolkit(Toolkit):
             return False  # Plan completion is not an official task verdict.
         return self._primitives.env.is_success()
 
-    def _register_robodojo_tools(self) -> None:
+    def _register_robodojo_tools(self, names: set[str]) -> None:
         from robots.robodojo import tools as robodojo_tools
 
+        if self.eval_fair or self.vla_agent:
+            common = {"read_text_file", "list_dir"} if self.vla_agent else set()
+            self._tools = {
+                name: entry for name, entry in self._tools.items() if name in common
+            }
         for definition in iter_tools(robodojo_tools):
-            if self._policy_only and definition.name != "view_env_state":
-                continue
-            if definition.name not in OBSERVATION_TOOLS:
+            if definition.name not in names & OBSERVATION_TOOLS:
                 continue
             resources = {"state": self._state}
             if definition.name in {"sample_world_xyz", "query_world_map"}:
@@ -192,25 +179,23 @@ class RoboDojoToolkit(Toolkit):
                 resources["primitives"] = self._primitives
             self.add_tool(definition.with_handler(partial(definition, **resources)))
         for definition in iter_tools(self._primitives):
-            if self._policy_only and definition.name != "finish":
-                continue
-            if definition.name == "vpp2_act" and self._primitives.vla_client is None:
+            if definition.name not in names:
                 continue
             self.add_tool(definition, replace=definition.name == "finish")
-        if self._stateful_policy:
+        if "run_policy" in names:
             from robots.robodojo.stateful_policy import run_policy
 
             self.add_tool(
                 run_policy.with_handler(
-                    partial(run_policy, primitives=self._primitives, state=self._state)
+                    partial(run_policy, primitives=self._primitives)
                 )
             )
-        if not self._policy_only:
+        if "render" in names:
             self.add_tool(self.render)
 
     @tool
     def render(self) -> ToolResult:
-        """Refresh the synchronized RGB-D, calibration and robot state record."""
+        """Capture fresh RGB and robot state, plus available geometry for enabled tools."""
         self.raise_if_cancelled()
         return ToolResult(data={"success": True})
 
@@ -223,28 +208,34 @@ class RoboDojoToolkit(Toolkit):
     ) -> ToolResult:
         from robots.robodojo import tools as robodojo_tools
 
-        if self.vla_agent:
-            result = dict(result)
-            if "episode_status" in result:
-                result["episode_status"] = {
-                    k: v
-                    for k, v in result["episode_status"].items()
-                    if k in {"step", "step_limit"}
-                }
-            result.pop("inferences", None)
-        record = robodojo_tools.dump_state(
-            self._primitives,
-            self._state,
+        if self.vla_agent and "episode_status" in result:
+            # Keep the existing public status boundary; inference metadata is
+            # retained in full in the standard execution record.
+            result = {
+                **result,
+                "episode_status": {
+                    key: value
+                    for key, value in result["episode_status"].items()
+                    if key in {"step", "step_limit"}
+                },
+            }
+        record = self._dump_state(
             log={"command": command, "result": result, "elapsed_s": elapsed_s},
             perception=self._pending_perception,
         )
         self._pending_perception = []
-        observed = robodojo_tools.view_env_state(record.step_idx, state=self._state)
-        if self._policy_only and command.get("action") == "run_policy":
-            summary = {k: v for k, v in result.items() if k != "inferences"}
-            summary["inference_count"] = len(result.get("inferences", []))
-            observed.data["log"] = {**observed.data["log"], "result": summary}
-        return observed
+        return robodojo_tools.view_env_state(record.step_idx, state=self._state)
+
+    def _dump_state(self, **kwargs):
+        from robots.robodojo import tools as robodojo_tools
+
+        return robodojo_tools.dump_state(
+            self._primitives,
+            self._state,
+            geometry="back_project" in self._tools,
+            require_rgb=self._stateful_policy,
+            **kwargs,
+        )
 
     def close(self) -> None:
         """Drain tools; the runtime owns the environment across planner sessions."""
@@ -254,23 +245,16 @@ class RoboDojoToolkit(Toolkit):
             drained = True
         finally:
             try:
-                end = getattr(self._primitives.env, "end_execution", None)
-                if end is not None:
-                    try:
+                if self._stateful_policy:
+                    self._primitives.env.release()
+                else:
+                    end = getattr(self._primitives.env, "end_execution", None)
+                    if end is not None:
                         end()
-                    except ExecutionSyncError:
-                        if drained:
-                            raise
-                        logger.exception(
-                            "Failed to close execution after tool cleanup failed"
-                        )
-            finally:
-                try:
-                    if self._stateful_policy:
-                        self._primitives.env.release()
-                finally:
-                    if self._agent is not None:
-                        self._agent.close()
+            except ExecutionSyncError:
+                if drained:
+                    raise
+                logger.exception("Failed to close execution after tool cleanup failed")
 
     def cancel_active_and_wait(self) -> None:
         super().cancel_active_and_wait()
@@ -284,16 +268,40 @@ class RoboDojoToolkit(Toolkit):
             resume()
         super().resume_calls()
 
-    def _execute_registered(self, name, input_dict):
-        before = self._primitives.env.get_execution_state() if self.vla_agent else None
-        self._finalizing = name == "finish"
+    def _execute_tool(self, tool, kwargs, input_dict):
+        name = tool.name
+        before = (
+            self._primitives.env.get_execution_state()
+            if self._stateful_policy
+            else None
+        )
+        previous_record = self._state.latest_step
         try:
-            result = super().execute_tool(name, input_dict)
-        finally:
-            self._finalizing = False
-        if self.vla_agent and result.data.get("state_capture_error"):
+            result = super()._execute_tool(tool, kwargs, input_dict)
+        except Exception as exc:
+            if not self._stateful_policy:
+                raise
+            # A state event can fail after motion was confirmed. Do not continue
+            # control when its feedback could not be delivered to the planner.
+            self._primitives.env.invalidate_execution(str(exc))
+            data = {"error": str(exc), "state_delivery_error": str(exc)}
+            if self._state.latest_step != previous_record:
+                from robots.robodojo.tools import planner_result
+
+                record = self._state.get()
+                data.update(
+                    step=record.step_idx,
+                    artifacts=sorted(record.artifacts),
+                    log={
+                        "command": record.command,
+                        "result": planner_result(record.result),
+                        "elapsed_s": record.elapsed_s,
+                    },
+                )
+            result = ToolResult(data=data)
+        if self._stateful_policy and result.data.get("state_capture_error"):
             self._primitives.env.invalidate_execution(
-                "Agent observation delivery failed"
+                "Planner observation delivery failed"
             )
             result.data["synchronization_trusted"] = False
         if name == "finish" and result.data.get("_finish"):
@@ -304,16 +312,18 @@ class RoboDojoToolkit(Toolkit):
                 except ExecutionSyncError as exc:
                     logger.exception("Failed to close execution after finish")
                     result.data.setdefault("error", str(exc))
-        if self.vla_agent:
+        if self._stateful_policy:
+            from robots.robodojo.tools import planner_result
+
             after = self._primitives.env.get_execution_state()
-            result.data.pop("inferences", None)
+            result.data = planner_result(result.data)
             result.data["execution"] = {
                 **after,
                 "step_before": before["confirmed_step"],
                 "step_after": after["confirmed_step"],
                 "confirmed_actions": after["confirmed_step"] - before["confirmed_step"],
             }
-        if not self.eval_fair and name in {
+        if not (self.eval_fair or self._stateful_policy) and name in {
             "segment",
             "back_project",
         }:
@@ -334,45 +344,26 @@ class RoboDojoToolkit(Toolkit):
                 )
         return result
 
-    def raise_if_cancelled(self):
-        super().raise_if_cancelled()
-        if self._agent is not None and not self._finalizing:
-            self._agent.check_deadline()
+    def _configure_memory_tools(self):
+        # Reuse the common memory readers without exposing source or other files.
+        for name in ("read_text_file", "list_dir"):
+            declaration = self._tools[name]
+            self.add_tool(
+                replace(
+                    declaration.with_handler(partial(self._read_memory, declaration)),
+                    description=(
+                        "Read a UTF-8 text file from the configured read-only memory."
+                        if name == "read_text_file"
+                        else "List the configured read-only memory; an empty path selects its root."
+                    ),
+                ),
+                replace=True,
+            )
 
-    def _configure_agent(self, kwargs, state_output_dir):
-        from robots.robodojo.collaboration import (
-            AgentCollaboration,
-            finish,
-            with_decision,
-        )
-
-        groups = set(kwargs.get("agent_tools", ("policy", "motion", "geometry")))
-        choices = {
-            "policy": {"run_policy"},
-            "motion": MOTION_TOOLS,
-            "geometry": {"back_project", "sample_world_xyz", "query_world_map"},
-            "sam3": {"segment"},
-        }
-        if not groups or groups - choices.keys():
-            raise ValueError("Unknown or empty Agent tool groups")
-        if "sam3" in groups and self._primitives.sam3_client is None:
-            raise ValueError("The sam3 tool group requires a SAM3 service")
-        obs = self._primitives._last_obs
-        from robots.robodojo.access import validate_rgbd
-
-        validate_rgbd(obs)
-        allowed = {"view_env_state", "render", "finish"}.union(
-            *(choices[g] for g in groups)
-        )
-        self._tools = {
-            name: with_decision(entry)
-            for name, entry in self._tools.items()
-            if name in allowed
-        }
-        self.add_tool(with_decision(finish), replace=True)
-        self._agent = AgentCollaboration(
-            Path(state_output_dir or get_output_dir()),
-            max_calls=kwargs.get("agent_max_calls", 120),
-            timeout_s=kwargs.get("agent_timeout_s", 1800),
-        )
-        self.add_tools(iter_tools(self._agent))
+    def _read_memory(self, declaration, path="", **kwargs):
+        resolved = self.memory.authorize_read(path or self.memory.root)
+        if not resolved.is_relative_to(self.memory.root.resolve()):
+            raise PermissionError(
+                "Mixed control file access is limited to configured memory"
+            )
+        return declaration(path=str(resolved), **kwargs)

@@ -17,8 +17,9 @@
 from __future__ import annotations
 
 ROLE_AND_RULES = """You control RoboDojo's dual ARX-X5 arms through registered tools.
-Read the native task instruction in view_env_state before acting. Use images,
-depth and robot proprioception, not hidden object poses or evaluator internals.
+Read the native task instruction in view_env_state before acting. Use available
+images and robot proprioception, and the registered geometry tools when needed.
+Do not use hidden object poses or evaluator internals.
 Do not control services or the robot through scripts, shell or direct RPC."""
 
 TOOL_ACCESS = """Use view_env_state to inspect recorded head and wrist images.
@@ -44,7 +45,7 @@ pixel manually; never invent coordinates from a failed detection.
 Segmentation returns image pixels, not world coordinates; follow with
 back_project when you need a visible surface's world position."""
 
-TOOLS = """move_to(arm, xyz, quat=None, gripper=None, substeps=25) plans a full
+MOTION_TOOLS = """move_to(arm, xyz, quat=None, gripper=None, substeps=25) plans a full
 pose. Quaternion order is wxyz; omitted orientation and opening are held.
 move_delta plans a relative world/tool-frame target in metres and degrees.
 hold(steps) retains controller targets while advancing native actions.
@@ -55,9 +56,9 @@ substeps samples the planned path, not time or physical simulation steps;
 0 keeps the full path, 1 keeps only the last waypoint.
 Inspect completed, executed_steps and stop_reason. final_dist_m is measured
 position error, not a task-success verdict. On failure, inspect and decide
-the next action; do not assume a failed call left the robot unmoved.
+the next action; do not assume a failed call left the robot unmoved."""
 
-vpp2_act(instruction, chunks=1) executes a current natural-language subtask,
+VPP2_POLICY = """vpp2_act(instruction, chunks=1) executes a current natural-language subtask,
 not automatically the original task. Describe the visible object, destination
 or relation, and necessary arm coordination or method, preferably in English.
 Do not use it as a millimetre-accurate coordinate controller; use analytic
@@ -91,14 +92,61 @@ Do not claim success from a successful tool call alone. reset is unavailable
 in this integration."""
 
 
-AWOMO_POLICY = """Execute the configured policy using the environment's original
-task instruction. Read `view_env_state` first. Call `run_policy(max_steps)` to
-advance a bounded number of control steps. A budget return pauses execution;
-continue calling the same tool until `episode_ended` is true.
-Keep the task instruction unchanged. The policy owns its internal subtask
-reasoning. Do not rewrite goals, insert scripted recovery actions, or finish
-early because an object has been grasped. On cancellation or error, report the
-interruption without retrying uncertain policy state or resetting the episode.
-Read-only inspection does not advance the policy's observation history.
-The runner owns service startup and shutdown. Episode end is not proof of
-task success."""
+AWOMO_POLICY = """You drive the official policy through bounded tool calls.
+Read `view_env_state` first and inspect feedback between calls. This mode provides
+no motion primitives: continue the policy while execution remains valid, rather
+than finishing because one apparent subgoal is achieved. On cancellation or
+error, report the interruption. The runner owns service startup and shutdown."""
+
+
+AWOMO_MIXED_CONTROL = """Solve the original task using the available tools.
+Choose control and perception from current observations; protect achieved goals
+and revise your approach when the actual result differs from your expectation.
+Inspect fresh images, confirmed action counts and stop reasons after controls.
+Call finish(status, summary) with your assessment and uncertainties. This is
+separate from the environment's success verdict. The runner records feedback
+and owns service cleanup; do not write run artifacts or manage services."""
+
+AWOMO_POLICY_TOOL = """run_policy(max_steps) executes Awomo using the original full
+task instruction, never a subtask rewrite. max_steps limits native actions in
+one call, not inference calls or action chunks; it cannot extend the episode's
+remaining native-action budget. The official model owns its internal replanning.
+A budget return preserves unused actions for the next call. If an enabled motion
+tool actually executes actions, the pending chunk is discarded while confirmed
+observations still enter model history; a zero-action rejection is not a takeover.
+Inspect results before choosing the next available tool."""
+
+AWOMO_FEEDBACK = """Use executed_steps and execution.confirmed_step for acknowledged
+action progress, including partial failures. step/step_idx selects a saved record;
+state.control.step is the native counter at capture; observation_step is relative
+to the model session. These indices are not interchangeable. Read-only inspection
+advances neither actions nor model history. inference_count summarizes inference
+events; complete inferences and metadata are retained in the standard states.json
+record, without another model call.
+Stop controlling on episode_ended or exhausted native-action budget. A completed
+tool call or ended episode is not proof of native task success. Cancellation
+pauses control; chunk retention and resumption are handled by the runtime. If
+execution or observation delivery is uncertain, ordinary resume cannot recover
+the session: report the error and finish without retrying. reset is unavailable
+to the planner."""
+
+AWOMO_GEOMETRY = """Use sample_world_xyz(view, pixels, step) for [row,col] pixels
+or query_world_map(view, bbox, step) for a half-open [r0,c0,r1,c1] region.
+Use head, left_wrist or right_wrist and the step of the source image.
+back_project converts a camera pixel using that frame's calibration and depth.
+Only views with saved geometry can be queried; missing data produces an error.
+Coordinates are world-frame metres. Invalid depth is not a point; a visible
+surface is not necessarily an object centre or safe grasp. Re-perceive after motion."""
+
+AWOMO_SEGMENTATION = """segment(text_prompt, camera, step) finds a visible object
+in a saved image. Describe colour, shape and relative location, not hidden asset
+names. Cameras are cam_head, cam_left_wrist and cam_right_wrist. Inspect the mask;
+a high score alone does not establish identity. point_rc is an image pixel,
+not a world coordinate. If detection fails, inspect another view or revise the
+description rather than inventing coordinates."""
+
+AWOMO_MEMORY = """Existing experience under {{memory_dir}} may guide planning.
+Use list_dir and read_text_file to inspect that read-only memory when relevant;
+the current task instruction and fresh observations take precedence. File access
+is limited to this configured memory, not task/evaluator source or hidden assets.
+No exploration, automatic memory writing or action replay is available."""

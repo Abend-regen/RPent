@@ -49,7 +49,6 @@ def run_scripted_policy_chain(
     action_count_field: str,
     before_action_calls: tuple[ScriptedToolCall, ...] = (),
     include_images: bool = False,
-    use_memory: bool = True,
 ) -> dict[str, Any]:
     """Run the public CLI against a deterministic loopback planner."""
     memory_dir = output_dir.parent / "offline-memory"
@@ -92,7 +91,8 @@ def run_scripted_policy_chain(
         *([] if include_images else ["--no-images"]),
         "--memory-profile",
         "local",
-        *(["--memory-dir", str(memory_dir)] if use_memory else []),
+        "--memory-dir",
+        str(memory_dir),
         "--output-dir",
         str(output_dir),
         *robot_argv,
