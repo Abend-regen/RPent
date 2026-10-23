@@ -316,11 +316,20 @@ for the full option list.
 Tools
 -----
 
-Use ``move_to`` for an absolute pose, ``move_delta`` for a relative pose, and
-``hold`` to advance actions with unchanged controller targets. ``rotate_wrist``,
-``set_gripper`` and ``release`` control orientation and gripper opening;
-``vpp2_act`` executes a language-guided subtask. The planner cannot reset an
-episode; exploration and Flash replay are unavailable.
+The planner cannot reset an episode; exploration and Flash replay are unavailable.
+
+``completed`` indicates completion of the tool request, not task success.
+Check ``stop_reason`` for early stops; ``executed_actions`` and
+``executed_steps`` both count confirmed actions. ``execution_uncertain=true``
+means some actions may have run without confirmation; they are excluded from
+these counts. The system does not retry automatically, and callers should
+not retry directly, to avoid executing actions twice.
+
+When working with a stateful policy, primitive takeover invalidates its
+cached remaining actions; the policy then replans from fresh observations.
+Lost synchronization or invalid policy history cannot be repaired by reading
+observations or resuming execution. A successful reset and restored
+synchronization are required; start a new episode if reset is unavailable.
 
 ``vpp2_act(instruction, chunks=1)`` runs the specified subtask. Each chunk
 predicts 32 absolute dual-arm EE16 targets (xyz, wxyz and gripper per arm)
@@ -328,8 +337,6 @@ and executes the first 24 through native EE control before replanning.
 VPP2 uses the initial RGB frame and eight history samples spaced by 25 actions.
 Both policy and primitive actions update this history; switching subtasks
 preserves it. Image reads and ``render`` do not advance the action timeline.
-Missing action feedback invalidates policy history until reset; start a new
-episode to resume VPP2 when reset is unavailable.
 
 ``view_env_state`` reads saved images and state; ``render`` captures a new
 observation. ``sample_world_xyz(view, pixels, step=None, neighborhood=1)``
@@ -362,58 +369,35 @@ and wxyz orientation. Omitted orientation and gripper targets are held.
 ``substeps`` caps sampled waypoints: 0 keeps the full path, 1 keeps only its
 final waypoint. It is not a speed or physics-step count. ``rotate_wrist``
 rotates about world Z in degrees. ``final_dist_m`` is measured position error,
-not an arrival guarantee. Check ``completed``, ``executed_steps`` and
-``stop_reason``; a timed-out mutation may have executed and is not retried.
+not an arrival guarantee.
+
+``move_delta`` plans a relative end-effector target for ``arm="left"`` or
+``"right"``. ``dxyz`` is a 3D translation in metres, defaulting to ``[0, 0, 0]``;
+``angle_deg`` is rotation in degrees about the 3D axis vector ``axis``, with
+defaults of ``0`` and ``[0, 0, 1]``, respectively. Vector components and the
+angle must be finite; a nonzero angle requires a nonzero axis, which need not
+be normalized. Rotation is centred on the end-effector origin at motion
+start. ``frame="world"`` (the default) expresses translation and axis direction
+in world coordinates; ``frame="tool"`` uses the tool coordinates at motion start.
+
+``substeps=25`` must be a nonnegative integer, with the same path sampling
+semantics as ``move_to``. The tool does not guarantee straight-line motion
+or multi-turn rotation.
+
+``gripper=None`` retains the existing gripper control target; explicit
+targets use the range and opening convention of ``set_gripper``. Zero translation and rotation without a gripper target
+execute no action; an explicit gripper target still triggers planning and
+execution even when translation and rotation are zero.
 
 ``set_gripper(arm, val, steps=10)`` uses 0=closed and 1=open. ``release``
 defaults to 1. Intermediate values are normalized opening targets rather than
 physical widths. Feedback comes from measured joints. Other controller targets
 are retained while the gripper moves.
 
-Relative Motion and Execution Feedback
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-``move_delta`` plans a relative end-effector target for ``arm``. ``dxyz`` is
-translation in metres; ``angle_deg`` is rotation in degrees about ``axis``
-(default ``[0, 0, 1]``), which passes through the initial end-effector origin.
-The default ``frame="world"`` expresses both translation and axis direction
-in world coordinates; ``frame="tool"`` uses the initial tool coordinates.
-A nonzero angle requires a nonzero axis. ``substeps=25`` samples the planned
-path as for ``move_to``; it does not specify physics steps. The target does
-not guarantee a straight-line or multi-turn trajectory. When translation and
-angle are both zero and ``gripper`` is omitted, the tool returns without
-executing an action.
-
-``hold(steps)`` requests a positive number of native actions while retaining
-both arms' and grippers' controller targets. Simulation and object motion
-continue; episode termination, the action budget or cancellation can stop it
-early. Both tools record their results through the usual action history.
-Each confirmed action contributes one observation to VPP2 history, including
-hold actions; reading observations does not advance it.
-
-Execution receipts describe the whole tool call. For ``vpp2_act``, this includes
-all requested chunks:
-
-- ``step_before`` is the native step at the start of the call. ``step_after``
-  and ``episode_status`` retain the last confirmed execution state.
-- ``requested_actions`` and ``executed_actions`` report the requested and
-  confirmed action counts; ``requested_steps`` and ``executed_steps`` report
-  the same counts. Two complete VPP2 chunks starting at step 1 therefore report
-  ``step_before=1``, ``step_after=49`` and ``executed_actions=48``.
-- ``completed`` describes command execution, not task success. Inspect
-  ``stop_reason``, ``terminated`` and ``truncated`` for early termination.
-  A later inference failure or cancellation preserves earlier confirmed actions.
-- ``execution_uncertain=true`` means an action may have run without a confirmed
-  receipt. That action is excluded from ``executed_actions``; ``step_after``
-  does not establish the current remote step. Do not retry the action blindly.
-
-When primitives take control, discard pending policy actions and replan from
-fresh observations before continuing the policy. Cancellation pauses further
-execution; resuming does not repair missing or unsynchronized feedback.
-After a lost reply or synchronization failure, reset the environment before
-policy inference. A successful reset clears the execution pause and
-reinitializes VPP2 history. Since the planner has no reset tool, start a new
-episode if the session cannot reset the environment.
+``hold(steps)`` requires a positive integer and advances that many native
+actions while retaining both arms' and grippers' control targets. Simulation
+continues; measured poses and objects need not stay still. Episode
+termination, the action budget or cancellation can stop execution early.
 
 .. _robodojo-local-nvidia-assets:
 
