@@ -111,7 +111,7 @@ def test_environment_primitives(monkeypatch):
                 check_pose_transition(
                     moved, env.get_motion_state()[f"{arm}_eef_pose"], yaw_deg=3
                 )
-            # Exercise VPP2's native EE route with a measured hold pose, without
+            # Exercise VPP2's native EE route with a measured EE pose, without
             # loading a policy. Analytic execution must already be in its history.
             policy_obs = env.policy_observation()
             assert policy_obs["inference_index"] == 1

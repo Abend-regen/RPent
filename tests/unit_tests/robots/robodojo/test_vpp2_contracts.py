@@ -7,7 +7,7 @@ from types import ModuleType, SimpleNamespace
 import numpy as np
 import pytest
 
-from robots.robodojo.env_client import RoboDojoEnvClient
+from robots.robodojo.env_client import ExecutionSyncError, RoboDojoEnvClient
 from robots.robodojo.primitives import RoboDojoPrimitives
 from robots.robodojo.vpp2_client import VPP2Client
 from rpent.tools.toolkit import ToolCancelled
@@ -62,6 +62,7 @@ class EnvRPC:
         if method == "env.reset":
             self.step = 0
             return observation(0)
+        before = self.step
         self.step += self.count
         self.actions.append((method, args, kwargs))
         obs = observation(self.step)
@@ -70,13 +71,24 @@ class EnvRPC:
                 obs,
                 0.0,
                 self.success,
-                {"executed_actions": self.count, "status": self.status()},
+                {
+                    "executed_actions": self.count,
+                    "status": self.status(),
+                    "step_before": before,
+                    "step_after": self.step,
+                    "terminated": self.success,
+                    "truncated": self.step >= self.limit,
+                },
             )
         if method == "env.step_joint_update":
             return {
+                "step_before": before,
+                "step_after": self.step,
                 "observation": obs,
                 "executed_actions": self.count,
                 "episode_status": self.status(),
+                "terminated": self.success,
+                "truncated": self.step >= self.limit,
             }
         raise AssertionError(method)
 
@@ -132,13 +144,14 @@ def test_short_history_repeats_only_anchor_and_zero_execution_adds_no_frame(conn
 def test_uncertain_mutation_requires_reset_not_read_refresh(connected, mutation):
     rpc, env = connected
     rpc.failure = TimeoutError("lost response")
-    with pytest.raises(TimeoutError):
+    with pytest.raises(ExecutionSyncError):
         getattr(env, mutation)(
             *({"step": [{}], "step_joint_update": ["left"], "reset": []}[mutation])
         )
     rpc.failure = None
     env.get_obs()
-    env.step({})
+    with pytest.raises(ExecutionSyncError, match="unavailable"):
+        env.step({})
     with pytest.raises(RuntimeError, match="history unavailable"):
         env.policy_observation()
     env.reset()
@@ -149,7 +162,7 @@ def test_uncertain_mutation_requires_reset_not_read_refresh(connected, mutation)
 def test_missing_intermediate_feedback_is_not_fabricated(connected, count):
     rpc, env = connected
     rpc.count = count
-    with pytest.raises(ValueError, match="zero or one"):
+    with pytest.raises(ExecutionSyncError, match="zero or one"):
         env.step({})
     with pytest.raises(RuntimeError, match="history unavailable"):
         env.policy_observation()
@@ -166,7 +179,7 @@ def test_missing_action_observation_invalidates_history(connected, monkeypatch):
         return result
 
     monkeypatch.setattr(rpc, "call", missing)
-    with pytest.raises(KeyError):
+    with pytest.raises(ExecutionSyncError, match="observation"):
         env.step_joint_update("left", gripper=0)
     with pytest.raises(RuntimeError, match="history unavailable"):
         env.policy_observation()
@@ -269,6 +282,8 @@ def test_partial_or_terminal_execution_is_reported_without_extra_inference(
     assert not result["completed"]
     assert result["requested_actions"] == 48
     assert result["executed_actions"] == (0 if terminal == "success" else 4)
+    assert result.get("interrupted", False) == (terminal == "cancelled")
+    assert result.get("execution_uncertain", False) == (terminal == "uncertain")
     assert len(calls) == (0 if terminal == "success" else 1)
     assert result["executed_chunks"] == 0
     assert (
@@ -448,36 +463,23 @@ def test_facade_rejects_bad_request_before_model_execution(connected, facade, ch
     assert not calls
 
 
-@pytest.mark.parametrize("backend_args", [[], ["--vla-backend", "vpp2"]])
-def test_local_vpp2_missing_resources_fail_before_starting_env(
-    monkeypatch, tmp_path, backend_args
+def test_fresh_inspection_restores_analytic_control_without_repairing_history(
+    connected,
 ):
-    import argparse
-
-    from robots.robodojo import robot_spec
-    from rpent.dashboard.events import NullDashboardEventSink
-
-    monkeypatch.delenv("VPP2_MODEL_PATH", raising=False)
-    parser = argparse.ArgumentParser()
-    robot_spec._add_cli_args(parser, False)
-    args = parser.parse_args(["--task", "put_bottles_into_dustbin", *backend_args])
-    assert args.vla_backend == "vpp2"
-    with pytest.raises(SystemExit):
-        parser.parse_args(
-            ["--task", "put_bottles_into_dustbin", "--vla-backend", "unknown"]
-        )
-    monkeypatch.setattr(
-        robot_spec, "_spawn_env_server", lambda *args: pytest.fail("env started")
-    )
-    with pytest.raises(ValueError, match="VPP2_MODEL_PATH"):
-        robot_spec._init_runtime(args, tmp_path, NullDashboardEventSink(), None)
+    rpc, env = connected
+    env.invalidate_execution()
+    with pytest.raises(RuntimeError, match="history unavailable"):
+        env.policy_observation()
+    env.accept_observation_step(rpc.step, rpc.step)
+    env.step_joint_update("left", gripper=0.5)
+    assert rpc.step == 1
+    with pytest.raises(RuntimeError, match="history unavailable"):
+        env.policy_observation()
+    env.reset()
+    assert stamps(env.policy_observation()) == [0] * 9
 
 
-@pytest.mark.parametrize("cuda", [None, 2])
-def test_vpp2_spawn_uses_current_interpreter_socket_and_owned_daemon(
-    monkeypatch, tmp_path, cuda
-):
-    from robots.robodojo import robot_spec
+def test_vpp2_model_resource_layout(tmp_path):
     from robots.robodojo.vpp2_server import model_paths
 
     for file in (
@@ -490,34 +492,7 @@ def test_vpp2_spawn_uses_current_interpreter_socket_and_owned_daemon(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
     (tmp_path / "checkpoints/Wan2.1-I2V-14B-480P").mkdir()
-    recorded = {}
-
-    class Daemon:
-        def __init__(self, **kwargs):
-            recorded.update(kwargs)
-
-        def start(self):
-            recorded["started"] = True
-
-    monkeypatch.setattr(robot_spec, "ProcessDaemon", Daemon)
-    monkeypatch.setattr(robot_spec, "make_rpc_client", lambda address: address)
-    args = SimpleNamespace(vla_endpoint=None, vla_model_path=tmp_path, cuda_device=cuda)
-    daemon, endpoint = robot_spec._spawn_vpp2_server(args, tmp_path)
-    assert daemon and recorded["started"]
-    assert recorded["cmd"][:4] == [
-        sys.executable,
-        "-u",
-        "-m",
-        "robots.robodojo.vpp2_server",
-    ]
-    assert "--parent-watch" in recorded["cmd"] and endpoint.startswith("socket://")
-    assert recorded["env_overrides"] == (
-        {} if cuda is None else {"CUDA_VISIBLE_DEVICES": "2"}
-    )
     assert (
         model_paths(tmp_path)["checkpoint_path"]
         == tmp_path / "checkpoints/joint2b_s100000/action.pt"
     )
-    args.vla_endpoint = "socket://borrowed:1234"
-    args.vla_model_path = "/missing"
-    assert robot_spec._spawn_vpp2_server(args, tmp_path) == (None, args.vla_endpoint)

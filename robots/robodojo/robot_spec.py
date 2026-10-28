@@ -20,6 +20,7 @@ import argparse
 import os
 import subprocess
 import sys
+from contextlib import suppress
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -32,7 +33,7 @@ from rpent.evaluation import RunFinalizationContext, write_json_atomic
 from rpent.memory import MemoryManager
 from rpent.robots.prompt_bundle import PromptBundle
 from rpent.robots.robot_spec import RobotSpec, RunConfig
-from rpent.robots.runtime import try_spawn_server, try_wait_server
+from rpent.robots.runtime import stop_owned_daemons, try_spawn_server, try_wait_server
 from rpent.utils.config import get_memory_dir, get_repo_root
 from rpent.utils.daemon import ProcessDaemon, pick_free_port
 from rpent.utils.rpc import make_rpc_client
@@ -65,7 +66,7 @@ ROBODOJO_DASHBOARD_SPEC: DashboardSpec = {
     "runtime_components": (
         {"name": "env", "label": "ENV", "scope": "unique"},
         {"name": "sam3", "label": "SAM3", "scope": "shared"},
-        {"name": "vla", "label": "VPP2", "scope": "shared"},
+        {"name": "vla", "label": "VLA", "scope": "shared"},
     ),
     "frame_channels": (
         {
@@ -96,6 +97,7 @@ ROBODOJO_DASHBOARD_SPEC: DashboardSpec = {
         "set_gripper",
         "release",
         "vpp2_act",
+        "awomo05_act",
     ),
 }
 
@@ -127,7 +129,6 @@ def _runtime_overrides(args: argparse.Namespace) -> dict[str, str]:
             [str(get_repo_root()), str(source), str(xpolicy)]
             + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])
         ),
-        "ROBODOJO_PI05_POLICY_ROOT": str(xpolicy / "policy" / "Pi_05"),
     }
     if os.environ.get("ROBODOJO_ASSETS_ROOT"):
         overrides["ROBODOJO_ASSETS_ROOT"] = os.environ["ROBODOJO_ASSETS_ROOT"]
@@ -172,6 +173,12 @@ def finalize_run(context: RunFinalizationContext) -> Path:
     return write_json_atomic(context.output_dir / "result.json", record)
 
 
+def _vla_model_path(args: argparse.Namespace) -> str | None:
+    """Select the resource root for the requested VLA backend."""
+    variable = f"{args.vla_backend.upper()}_MODEL_PATH"
+    return getattr(args, "vla_model_path", None) or os.environ.get(variable)
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     """Reject unsupported replay and invalid scene identity before startup."""
     if getattr(args, "planner", None) == "flash":
@@ -181,6 +188,11 @@ def _validate_args(args: argparse.Namespace) -> None:
     for name in ("seed", "layout"):
         if getattr(args, name, 0) < 0:
             raise ValueError(f"{name} must be nonnegative")
+
+    backend = getattr(args, "vla_backend", "vpp2")
+    if backend == "awomo05":
+        if args.env_cfg_type != "arx_x5" or args.action_type != "joint":
+            raise ValueError("awomo05 requires arx_x5 with absolute joint actions")
 
 
 def get_toolkit(
@@ -228,17 +240,6 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         help="Python executable with Isaac Sim and RoboDojo installed",
     )
     parser.add_argument(
-        "--policy-backend",
-        choices=["rlinf", "xpolicylab"],
-        default="rlinf",
-        help="Legacy Pi0.5 backend for explicit VLA diagnostics; not started by default",
-    )
-    parser.add_argument(
-        "--pi05-python",
-        default=sys.executable,
-        help="Python executable for explicit legacy Pi0.5 diagnostics",
-    )
-    parser.add_argument(
         "--task",
         default=DEFAULT_TASK,
         required=required,
@@ -283,17 +284,21 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         help="[protocol://]host:port of an existing env_server",
     )
     parser.add_argument(
-        "--vla-backend", choices=("vpp2",), default="vpp2", help="VLA policy backend"
+        "--vla-backend",
+        choices=("vpp2", "awomo05"),
+        default="vpp2",
+        help="VLA policy backend",
     )
     parser.add_argument(
         "--vla-model-path",
-        default=os.environ.get("VPP2_MODEL_PATH"),
-        help="VPP2 resource root containing policy/ and checkpoints/ (or VPP2_MODEL_PATH)",
+        default=None,
+        help="VLA resource root containing policy/ and checkpoints/ "
+        "(or VPP2_MODEL_PATH / AWOMO05_MODEL_PATH for the selected backend)",
     )
     parser.add_argument(
         "--vla-endpoint",
         default=None,
-        help="socket://host:port of an existing VPP2 server",
+        help="[protocol://]host:port of an existing RPent VLA RPC server",
     )
     parser.add_argument(
         "--sam3-endpoint",
@@ -338,6 +343,7 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
             "task_summary": summary,
             "memory_dir": str(memory_dir),
             "mode": "eval-fair" if eval_fair else "dev",
+            "vla_backend": args.vla_backend,
         },
         task_desc={
             "task": args.task,
@@ -440,93 +446,27 @@ def _spawn_sam3_server(
     return daemon, HttpRpcClient(f"http://{host}:{port}")
 
 
-def _spawn_vla_server(
-    args: argparse.Namespace, output_dir: Path
+def _spawn_model_server(
+    args: argparse.Namespace,
+    output_dir: Path,
+    *,
+    model_path: str | None,
+    rpc_options: dict[str, Any],
 ) -> tuple["ProcessDaemon | None", RpcClient]:
-    """Spawn (or attach to) the RoboDojo Pi_05 VLA server."""
+    """Start a local model or borrow its RPC endpoint with the required session mode."""
     if args.vla_endpoint is not None:
-        return None, make_rpc_client(args.vla_endpoint)
-
-    pi05_python = str(Path(args.pi05_python).expanduser())
-    if not Path(pi05_python).exists():
-        raise RuntimeError(f"RoboDojo Pi_05 env python not found: {pi05_python}")
+        return None, make_rpc_client(args.vla_endpoint, **rpc_options)
     host, port = "127.0.0.1", pick_free_port()
-    overrides = _runtime_overrides(args)
-    if args.policy_backend == "rlinf":
-        # End-to-end policy-chain smoke only (real weights, one prediction);
-        # simulation task success rates have not yet been established.
-        policy_args = [
-            "rpent.robots.components.pi05_vla_server",
-            "--embodiment",
-            "robodojo",
-        ]
-    else:
-        policy_args = [
-            "rpent.robots.components.xpolicylab_vla_server",
-            "--output-dir",
-            str(output_dir),
-            "--policy-root",
-            overrides["ROBODOJO_PI05_POLICY_ROOT"],
-            "--bench",
-            "RoboDojo",
-            "--evaluation-id",
-            os.environ.get(
-                "ROBODOJO_RUN_ID", datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            ),
-            "--task",
-            args.task,
-            "--env-cfg-type",
-            args.env_cfg_type,
-            "--action-type",
-            args.action_type,
-            "--ckpt",
-            "RoboDojo-sim-arx_x5-joint-0",
-            "--policy-port",
-            str(pick_free_port()),
-        ]
-        if args.cuda_device is not None:
-            policy_args += ["--policy-gpu", str(args.cuda_device)]
+    name = f"robodojo_{args.vla_backend}_server"
     daemon = ProcessDaemon(
-        name="robodojo_vla_server",
-        cmd=[
-            pi05_python,
-            "-u",
-            "-m",
-            *policy_args,
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--transport",
-            "http",
-            "--parent-watch",
-        ],
-        env_overrides=overrides,
-        log_path=str(Path(output_dir) / "robodojo_vla_server.log"),
-    )
-    daemon.start()
-    return daemon, HttpRpcClient(f"http://{host}:{port}")
-
-
-def _spawn_vpp2_server(
-    args: argparse.Namespace, output_dir: Path
-) -> tuple["ProcessDaemon | None", RpcClient]:
-    """Start VPP2 in this interpreter, or borrow a separately managed service."""
-    if args.vla_endpoint is not None:
-        return None, make_rpc_client(args.vla_endpoint)
-    from robots.robodojo.vpp2_server import model_paths
-
-    model_paths(args.vla_model_path)
-    host, port = "127.0.0.1", pick_free_port()
-    daemon = ProcessDaemon(
-        name="robodojo_vpp2_server",
+        name=name,
         cmd=[
             sys.executable,
             "-u",
             "-m",
-            "robots.robodojo.vpp2_server",
+            f"robots.robodojo.{args.vla_backend}_server",
             "--model-path",
-            str(Path(args.vla_model_path).expanduser().resolve()),
+            str(Path(model_path).expanduser().resolve()),
             "--host",
             host,
             "--port",
@@ -538,10 +478,15 @@ def _spawn_vpp2_server(
             if args.cuda_device is not None
             else {}
         ),
-        log_path=str(Path(output_dir) / "robodojo_vpp2_server.log"),
+        log_path=str(Path(output_dir) / f"{name}.log"),
     )
-    daemon.start()
-    return daemon, make_rpc_client(f"socket://{host}:{port}")
+    try:
+        daemon.start()
+        rpc = make_rpc_client(f"socket://{host}:{port}", **rpc_options)
+    except BaseException:
+        daemon.stop()
+        raise
+    return daemon, rpc
 
 
 def _init_runtime(
@@ -550,22 +495,38 @@ def _init_runtime(
     dashboard_events: DashboardEventSink,
     components: set[str] | None,
 ) -> tuple[list[ProcessDaemon], dict[str, Any]]:
-    """Start Env, SAM3 and VPP2, or only the requested Dashboard components."""
+    """Start default backend services or an explicitly requested component set."""
     _validate_args(args)
     from robots.robodojo.env_client import RoboDojoEnvClient
-    from robots.robodojo.vpp2_client import VPP2Client
     from rpent.robots.components.sam3_client import Sam3Client
 
-    vla_starter = {"vpp2": _spawn_vpp2_server}[args.vla_backend]
+    if args.vla_backend == "awomo05":
+        from robots.robodojo.awomo05_client import Awomo05Client as VLAClient
+        from robots.robodojo.awomo05_server import model_paths
+
+        rpc_options = {"enable_sessions": True}
+        record_vpp2_history = False
+    elif args.vla_backend == "vpp2":
+        from robots.robodojo.vpp2_client import VPP2Client as VLAClient
+        from robots.robodojo.vpp2_server import model_paths
+
+        rpc_options = {}
+        record_vpp2_history = True
+    else:
+        raise ValueError(f"unknown RoboDojo VLA backend: {args.vla_backend}")
+    model_path = _vla_model_path(args)
     starters = {
         "env": lambda: _spawn_env_server(args, output_dir),
-        "vla": lambda: vla_starter(args, output_dir),
+        "vla": lambda: _spawn_model_server(
+            args, output_dir, model_path=model_path, rpc_options=rpc_options
+        ),
         "sam3": lambda: _spawn_sam3_server(args, output_dir),
     }
     connectors = {
         "env": lambda rpc: {
             "env": RoboDojoEnvClient(
                 rpc,
+                record_vpp2_history=record_vpp2_history,
                 expected_meta={
                     "task": args.task,
                     "layout": args.layout,
@@ -585,45 +546,53 @@ def _init_runtime(
                 },
             )
         },
-        "vla": lambda rpc: {"vla_client": VPP2Client(rpc)},
+        "vla": lambda rpc: {"vla_client": VLAClient(rpc)},
         "sam3": lambda rpc: {"sam3_client": Sam3Client(rpc)},
     }
     timeouts = {"env": 900.0, "sam3": 300.0, "vla": 1800.0}
     wait_order = ("env", "sam3", "vla")
-    selected = {"env", "sam3", "vla"} if components is None else set(components)
+    selected = set(starters) if components is None else set(components)
     unknown = selected.difference(starters)
     if unknown:
         raise ValueError(f"unknown RoboDojo runtime components: {sorted(unknown)}")
     if "vla" in selected and args.vla_endpoint is None:
-        from robots.robodojo.vpp2_server import model_paths
-
-        model_paths(args.vla_model_path)
+        model_paths(model_path)
 
     pending: dict[str, tuple[ProcessDaemon | None, RpcClient]] = {}
     owned_daemons: dict[str, ProcessDaemon] = {}
-    for component, starter in starters.items():
-        if component in selected:
-            pending[component] = try_spawn_server(
+    try:
+        for component, starter in starters.items():
+            if component in selected:
+                pending[component] = try_spawn_server(
+                    owned_daemons,
+                    dashboard_events,
+                    component,
+                    starter,
+                )
+
+        primitives_kwargs: dict[str, Any] = {}
+        for component in (name for name in wait_order if name in pending):
+            daemon, rpc = pending[component]
+            component_kwargs = try_wait_server(
                 owned_daemons,
                 dashboard_events,
                 component,
-                starter,
+                rpc,
+                daemon,
+                timeouts[component],
+                post_fn=partial(connectors[component], rpc),
             )
-
-    primitives_kwargs: dict[str, Any] = {}
-    for component in (name for name in wait_order if name in pending):
-        daemon, rpc = pending[component]
-        component_kwargs = try_wait_server(
-            owned_daemons,
-            dashboard_events,
-            component,
-            rpc,
-            daemon,
-            timeouts[component],
-            post_fn=partial(connectors[component], rpc),
-        )
-        primitives_kwargs.update(component_kwargs)
+            primitives_kwargs.update(component_kwargs)
+    except BaseException as exc:
+        # Shared helpers clean up ordinary failures; interruption is owned here.
+        if not isinstance(exc, Exception):
+            stop_owned_daemons(owned_daemons, dashboard_events)
+        for _, rpc in pending.values():
+            with suppress(Exception):
+                rpc.close()
+        raise
 
     primitives_kwargs["action_type"] = args.action_type
     primitives_kwargs["task"] = args.task
+    primitives_kwargs["vla_backend"] = args.vla_backend
     return list(owned_daemons.values()), primitives_kwargs

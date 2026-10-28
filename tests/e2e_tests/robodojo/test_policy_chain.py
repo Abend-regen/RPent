@@ -19,28 +19,25 @@ pytestmark = [
         os.environ.get("RPENT_RUN_ROBODOJO_INTEGRATION") != "1",
         reason="requires a reserved GPU, RoboDojo assets and model checkpoints",
     ),
-    pytest.mark.skipif(
-        not (
-            os.environ.get("VPP2_MODEL_PATH")
-            or os.environ.get("RPENT_ROBODOJO_VLA_ENDPOINT")
-        ),
-        reason="default CLI requires VPP2 resources or a borrowed VPP2 endpoint",
-    ),
 ]
 
 
-@pytest.mark.parametrize(
-    "action",
-    [
-        ScriptedToolCall("set_gripper", {"arm": "left", "val": 0.5, "steps": 2}),
-        ScriptedToolCall(
-            "vpp2_act",
-            {"instruction": "Pick up the pink bottle on the table", "chunks": 1},
-        ),
-    ],
-)
-def test_policy_chain(action):
-    output = Path(os.environ["RPENT_E2E_OUTPUT_DIR"]) / f"policy-chain-{action.name}"
+@pytest.mark.parametrize("control", ["primitive", "policy"])
+def test_policy_chain(control, vla_backend):
+    if control == "primitive":
+        action = ScriptedToolCall(
+            "set_gripper", {"arm": "left", "val": 0.5, "steps": 2}
+        )
+    else:
+        arguments = {"chunks": 1}
+        if vla_backend == "vpp2":
+            arguments["instruction"] = "Pick up the pink bottle on the table"
+        action = ScriptedToolCall(f"{vla_backend}_act", arguments)
+    output = Path(os.environ["RPENT_E2E_OUTPUT_DIR"]) / (
+        f"policy-chain-{action.name}"
+        if vla_backend == "vpp2"
+        else f"policy-chain-awomo05-{action.name}"
+    )
     endpoint = os.environ.get("RPENT_ROBODOJO_VLA_ENDPOINT")
     result = run_scripted_policy_chain(
         robot="robodojo",
@@ -51,6 +48,7 @@ def test_policy_chain(action):
             "0",
             "--layout",
             "0",
+            *(["--vla-backend", vla_backend] if vla_backend != "vpp2" else []),
             *(["--vla-endpoint", endpoint] if endpoint else []),
         ],
         output_dir=output,
