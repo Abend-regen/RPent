@@ -1,7 +1,7 @@
 RoboDojo
 ========
 
-通过 RPent 在 RoboDojo 中执行双臂桌面操作任务。仿真器基于 Isaac Sim / IsaacLab，采用 ARX-X5 双机械臂平台。RPent 结合 VPP2 策略动作、原生运动 Primitive 和 SAM3 物体分割完成任务。
+通过 RPent 在 RoboDojo 中执行双臂桌面操作任务。仿真器基于 Isaac Sim / IsaacLab，采用 ARX-X5 双机械臂平台。RPent 结合策略动作、原生运动 Primitive 和 SAM3 物体分割完成任务。策略动作可选择 VPP2 或 Awomo05。
 
 概览
 ----
@@ -11,7 +11,7 @@ RoboDojo
 
    .. grid-item-card:: 动作模型
 
-      解析式 Primitive 和 VPP2
+      解析式 Primitive 和 VPP2（默认）、Awomo05
 
    .. grid-item-card:: 规划器
 
@@ -63,7 +63,7 @@ RoboDojo
    * - 观测
      - 头部和左右腕部相机的 RGB-D 图像、相机标定，以及双臂关节状态、末端执行器位姿和夹爪开合状态。
    * - 动作
-     - ``move_to``、``rotate_wrist``、``set_gripper``、``release`` 和 ``vpp2_act``。``finish`` 不能覆盖原生任务判定。
+     - ``move_to``、``rotate_wrist``、``set_gripper``、``release`` 和 ``vpp2_act``、``awomo05_act``。``finish`` 不能覆盖原生任务判定。
    * - 奖励与成功判定
      - 任务是否成功由 RoboDojo 原生环境判定，结果记录在 ``result.json`` 的 ``success`` 字段中。
    * - 任务指令
@@ -149,7 +149,15 @@ NVIDIA 驱动版本建议参考 `Isaac Sim 5.1 官方系统要求 <https://docs.
 VLA 配置
 --------
 
-VPP2 是默认动作模型，通过 ``--vla-backend vpp2`` 选择。准备官方 `VPP2 RoboDojo 实现 <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_ 和 `Haodong082399/VPP2 <https://huggingface.co/Haodong082399/VPP2>`_ 发布的配对 100k 权重。资源目录可以自行选择；以下以 ``/path/to/vpp2`` 为例，使用时替换为自己的目录：
+通过 ``--vla-backend vpp2|awomo05`` 选择动作模型；省略时默认使用 ``vpp2``。模型实现与权重如下：
+
+- VPP2：官方 `VPP2 RoboDojo 实现 <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_，以及 `Haodong082399/VPP2 <https://huggingface.co/Haodong082399/VPP2>`_ 发布的配对 100k 权重。
+- Awomo05：`官方实现 <https://github.com/Awomo-WestlakeDI/Awomo-0.5>`_、`XPolicyLab RoboDojo 评测适配器 <https://github.com/XPolicyLab/XPolicyLab/blob/562c14cf08b9e6e411e7d76f192740afced77160/policy/Awomo05/README.md>`__，以及 `Auwomo/Awomo-0.5-Robodojo 权重与配套统计文件 <https://huggingface.co/Auwomo/Awomo-0.5-Robodojo>`_。
+
+VPP2 配置
+~~~~~~~~~
+
+准备上面的 VPP2 实现和配对权重。资源目录可以自行选择；以下以 ``/path/to/vpp2`` 为例，使用时替换为自己的目录：
 
 .. code-block:: bash
 
@@ -184,6 +192,49 @@ VPP2 是默认动作模型，通过 ``--vla-backend vpp2`` 选择。准备官方
      --host 127.0.0.1 --port 9201
 
 在 RPent／仿真环境的任务命令中添加 ``--vla-endpoint socket://127.0.0.1:9201``。RPent 负责启动和关闭自己创建的模型进程；独立启动的服务由其启动者管理。远端部署见 :doc:`../guides/advanced_deployment`。
+
+Awomo05 配置
+~~~~~~~~~~~~
+
+准备上面的 Awomo05 评测实现和配对权重。资源目录可以自行选择；以下以 ``/path/to/awomo05`` 为例，使用时替换为自己的目录：
+
+.. code-block:: bash
+
+   export AWOMO05_MODEL_PATH=/path/to/awomo05
+   git clone --no-checkout https://github.com/RoboDojo-Benchmark/RoboDojo.git \
+     "$AWOMO05_MODEL_PATH/policy"
+   git -C "$AWOMO05_MODEL_PATH/policy" checkout 2184bf8844ea9d205382c4aefa3a694311418251
+   git -C "$AWOMO05_MODEL_PATH/policy" submodule update --init XPolicyLab
+   git -C "$AWOMO05_MODEL_PATH/policy/XPolicyLab" fetch origin 562c14cf08b9e6e411e7d76f192740afced77160
+   git -C "$AWOMO05_MODEL_PATH/policy/XPolicyLab" checkout 562c14cf08b9e6e411e7d76f192740afced77160
+   export AWOMO05_WEIGHTS="$AWOMO05_MODEL_PATH/checkpoints"
+   bash "$AWOMO05_MODEL_PATH/policy/XPolicyLab/policy/Awomo05/download_weights.sh"
+
+资源根目录采用以下布局，子目录可以通过软链接复用已有资源：
+
+.. code-block:: text
+
+   awomo05/
+   ├── policy/
+   │   ├── env_cfg/arx_x5.yml
+   │   └── XPolicyLab/policy/Awomo05/model.py
+   └── checkpoints/
+       ├── model.pt
+       ├── dataset_stats.json
+       ├── flux2-klein-base-4b/
+       ├── flux2-dev/
+       └── Qwen3-VL-4B-Instruct/
+
+按固定版本的 `推理环境说明 <https://github.com/XPolicyLab/XPolicyLab/blob/562c14cf08b9e6e411e7d76f192740afced77160/policy/Awomo05/README.md>`__ 安装模型依赖。这些依赖与 ``.[robodojo-sim]`` 分开安装。模型依赖与 RPent 环境兼容时，设置 ``AWOMO05_MODEL_PATH`` 即可自动启动本地服务，``--vla-model-path`` 可覆盖该路径。本地服务使用 RPent 当前的 Python 解释器，在单张 GPU 上加载完整模型。
+
+若使用独立模型环境，在该环境中安装策略依赖和 RPent 核心包，然后启动服务：
+
+.. code-block:: bash
+
+   python -m robots.robodojo.awomo05_server --model-path /path/to/awomo05 \
+     --host 127.0.0.1 --port 9205
+
+在 RPent／仿真环境的任务命令中添加 ``--vla-endpoint socket://127.0.0.1:9205``。RPent 负责启动和关闭自己创建的模型进程；独立启动的服务由其启动者管理。远端部署见 :doc:`../guides/advanced_deployment`。
 
 SAM3 配置
 ---------
@@ -234,7 +285,7 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 - ``states.json``：工具命令、执行结果及同帧观测记录。
 - 各相机逐步保存的 RGB、米制深度、标定和世界坐标三维图。
 - ``videos/``：头部、左腕和右腕相机的视频。
-- ``robodojo_env_server.log``、``sam3_server.log``、``robodojo_vpp2_server.log``：\
+- ``robodojo_env_server.log``、``sam3_server.log``、``robodojo_vpp2_server.log`` 或 ``robodojo_awomo05_server.log``：\
   本地启动服务的日志和报错信息。
 - ``run.log`` 和 ``transcript_*.json``：主进程日志、planner 对话和错误。
 
@@ -248,15 +299,14 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 常用参数
 --------
 
-默认由 RPent 在当前 Python 环境中启动仿真、SAM3 和 VPP2 服务。仿真器安装在独立环境时，指定 ``--sim-python``。
+默认由 RPent 在当前 Python 环境中启动仿真、SAM3 和所选 VLA 模型服务。仿真器安装在独立环境时，指定 ``--sim-python``。
 
 使用 ``--task`` 选择任务。固定场景通过 ``--seed`` 选择官方布局组，通过 ``--layout`` 选择组内布局，两者默认均为 ``0``。例如，``--task stack_blocks --seed 0 --layout 2`` 使用第 0 组的第 2 个布局。需要随机生成场景时，添加 ``--random``，此时 ``--layout`` 不生效。
 
 - ``--cuda-device``：为本地启动的服务选择 GPU；省略时沿用 ``CUDA_VISIBLE_DEVICES``。
-- ``--vla-backend``：选择动作模型，目前支持 ``vpp2``。
-- ``--vla-model-path``：覆盖 ``VPP2_MODEL_PATH``，指向包含 ``policy/`` 和 ``checkpoints/`` 的资源根目录。
-- ``--env-endpoint``、``--sam3-endpoint``、``--vla-endpoint``：连接已有服务。\
-  VLA 服务必须实现本适配器的 VPP2 协议。
+- ``--vla-backend``：选择动作模型，目前支持 ``vpp2`` 或 ``awomo05``。
+- ``--vla-model-path``：指向包含 ``policy/`` 和 ``checkpoints/`` 的资源根目录，覆盖所选后端的 ``VPP2_MODEL_PATH`` 或 ``AWOMO05_MODEL_PATH``。
+- ``--env-endpoint``、``--sam3-endpoint``、``--vla-endpoint``：连接已有 RPent RPC 服务；VLA 协议必须匹配所选后端。
 - ``--source-root``：使用本地 RoboDojo 源码替代包内源码。
 
 子服务继承当前终端的环境变量；CLI 不会自动读取 ``config/runtime.env``。\
@@ -270,7 +320,9 @@ SAM3 用于物体分割。先在 `facebook/sam3 模型页面 <https://huggingfac
 初始观测和运动反馈包含 ``episode_status.step`` （已用原生动作步数）、``step_limit`` （总步数上限）和 ``remaining_steps`` （剩余步数）。
 这些计数对应观测保存时的状态；顶层 ``step`` 是观测记录编号。读取历史观测不会消耗动作步数。
 
-``vpp2_act(instruction, chunks=1)`` 执行指定子任务。每个 chunk 预测 32 个双臂 EE16 绝对目标（每臂 xyz、wxyz 和夹爪），通过原生 EE 控制执行前 24 步，再重新推理。VPP2 使用初始 RGB 帧和间隔为 25 个动作的 8 个历史采样。策略动作和 Primitive 动作都会更新历史，切换子任务时保留历史；看图和 ``render`` 不增加动作时刻。动作反馈缺失后，策略历史失效，直到 reset；无法 reset 时，需开始新回合才能恢复 VPP2。
+``vpp2_act(instruction, chunks=1)`` 执行指定子任务。每个 chunk 预测 32 个双臂 EE16 绝对目标（每臂 xyz、wxyz 和夹爪），通过原生 EE 控制执行前 24 步；``chunks=1`` 时返回规划器，继续下一块时重新推理。VPP2 使用初始 RGB 帧和间隔为 25 个动作的 8 个历史采样。策略动作和 Primitive 动作都会更新历史，切换子任务时保留历史；看图和 ``render`` 不增加动作时刻。动作反馈缺失后，策略历史失效，直到 reset；无法 reset 时，需开始新回合才能恢复 VPP2。
+
+选择 Awomo05 后端时，使用 ``awomo05_act(chunks=1)`` 按官方完整任务指令执行双臂关节目标。任务指令取自回合初始观测，在该回合内保持不变。每块执行 8 步并逐步更新观测，下一块重新推理；``chunks`` 限制单次调用的动作块数。模型历史跨调用保留，也包含运动 Primitive 执行后的观测。取消后不续接剩余动作；推理或执行结果不确定时，需检查错误并开始新回合，不应直接重试。
 
 ``view_env_state`` 读取保存的图像和状态，``render`` 刷新观测。``sample_world_xyz(view, pixels, step=None, neighborhood=1)`` 查询 [行,列] 像素，默认取 3×3 邻域。``query_world_map`` 查询半开区间 [r0,c0,r1,c1]，默认最多返回 256 个点。view 使用 ``head``、``left_wrist`` 或 ``right_wrist``，必须与选点图像的视角及步号一致。查询读取保存的同帧深度，不暗中刷新；无效深度被排除，返回的是可见表面坐标，不是物体中心。
 

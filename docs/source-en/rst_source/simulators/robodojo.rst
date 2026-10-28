@@ -2,8 +2,9 @@ RoboDojo
 ========
 
 Run bimanual tabletop tasks with RPent in RoboDojo. The simulator uses
-Isaac Sim / IsaacLab with an ARX-X5 dual-arm platform. RPent combines VPP2
-policy actions, native motion primitives and SAM3 object segmentation.
+Isaac Sim / IsaacLab with an ARX-X5 dual-arm platform. RPent combines policy
+actions, native motion primitives and SAM3 object segmentation to complete tasks.
+Choose VPP2 or Awomo05 for policy actions.
 
 Overview
 --------
@@ -13,7 +14,7 @@ Overview
 
    .. grid-item-card:: Action Models
 
-      Scripted primitives and VPP2
+      Analytical primitives, VPP2 (default), and Awomo05
 
    .. grid-item-card:: Planners
 
@@ -66,7 +67,7 @@ Observation and Action
    * - Observation
      - Head and left/right wrist RGB-D images, camera calibration, and joint states, end-effector poses, and gripper states for both arms.
    * - Action
-     - ``move_to``, ``rotate_wrist``, ``set_gripper``, ``release``, and ``vpp2_act``. ``finish`` cannot override the native task verdict.
+     - ``move_to``, ``rotate_wrist``, ``set_gripper``, ``release``, ``vpp2_act``, and ``awomo05_act``. ``finish`` cannot override the native task verdict.
    * - Reward / success
      - RoboDojo's native environment determines task success, recorded in the ``success`` field of ``result.json``.
    * - Task prompt
@@ -165,13 +166,20 @@ For offline use or repeated resource-loading failures, see
 VLA Configuration
 -----------------
 
-VPP2 is the default action model, selected with ``--vla-backend vpp2``.
-Prepare the official
-`VPP2 RoboDojo implementation <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_
-and the paired 100k weights from
-`Haodong082399/VPP2 <https://huggingface.co/Haodong082399/VPP2>`_.
-Choose a resource directory and set its location, as in the following example.
-Replace ``/path/to/vpp2`` with your own directory:
+Select ``--vla-backend vpp2|awomo05``; omitting it selects ``vpp2``.
+The model implementations and weights are available here:
+
+- VPP2: the official `VPP2 RoboDojo implementation <https://github.com/roboterax/video-prediction-policy-2/tree/72c17acf022494ff63617be86079bb92e92f5bf8>`_
+  and the paired 100k weights from `Haodong082399/VPP2 <https://huggingface.co/Haodong082399/VPP2>`_.
+- Awomo05: the `official author implementation <https://github.com/Awomo-WestlakeDI/Awomo-0.5>`_,
+  the `XPolicyLab RoboDojo evaluation adapter <https://github.com/XPolicyLab/XPolicyLab/blob/562c14cf08b9e6e411e7d76f192740afced77160/policy/Awomo05/README.md>`__
+  and the `Auwomo/Awomo-0.5-Robodojo weights and matching statistics <https://huggingface.co/Auwomo/Awomo-0.5-Robodojo>`_.
+
+VPP2 Setup
+~~~~~~~~~~
+
+Prepare the VPP2 implementation and paired weights above. Choose a resource
+directory and replace ``/path/to/vpp2`` with your own directory:
 
 .. code-block:: bash
 
@@ -214,6 +222,61 @@ core package there, then start the service:
      --host 127.0.0.1 --port 9201
 
 Add ``--vla-endpoint socket://127.0.0.1:9201`` to the task command in the
+RPent/simulator environment. RPent starts and stops its own model process;
+independently started services remain under their operator's control.
+For remote deployment, see :doc:`../guides/advanced_deployment`.
+
+Awomo05 Setup
+~~~~~~~~~~~~~
+
+Prepare the Awomo05 evaluation implementation and paired weights above.
+Choose a resource directory and replace ``/path/to/awomo05`` with your own directory:
+
+.. code-block:: bash
+
+   export AWOMO05_MODEL_PATH=/path/to/awomo05
+   git clone --no-checkout https://github.com/RoboDojo-Benchmark/RoboDojo.git \
+     "$AWOMO05_MODEL_PATH/policy"
+   git -C "$AWOMO05_MODEL_PATH/policy" checkout 2184bf8844ea9d205382c4aefa3a694311418251
+   git -C "$AWOMO05_MODEL_PATH/policy" submodule update --init XPolicyLab
+   git -C "$AWOMO05_MODEL_PATH/policy/XPolicyLab" fetch origin 562c14cf08b9e6e411e7d76f192740afced77160
+   git -C "$AWOMO05_MODEL_PATH/policy/XPolicyLab" checkout 562c14cf08b9e6e411e7d76f192740afced77160
+   export AWOMO05_WEIGHTS="$AWOMO05_MODEL_PATH/checkpoints"
+   bash "$AWOMO05_MODEL_PATH/policy/XPolicyLab/policy/Awomo05/download_weights.sh"
+
+The resource root has the following layout. Subdirectories may be symbolic
+links to existing resources:
+
+.. code-block:: text
+
+   awomo05/
+   ├── policy/
+   │   ├── env_cfg/arx_x5.yml
+   │   └── XPolicyLab/policy/Awomo05/model.py
+   └── checkpoints/
+       ├── model.pt
+       ├── dataset_stats.json
+       ├── flux2-klein-base-4b/
+       ├── flux2-dev/
+       └── Qwen3-VL-4B-Instruct/
+
+Install the model dependencies using the pinned project's
+`inference environment instructions <https://github.com/XPolicyLab/XPolicyLab/blob/562c14cf08b9e6e411e7d76f192740afced77160/policy/Awomo05/README.md>`__.
+These dependencies are separate from ``.[robodojo-sim]``. When the model
+dependencies are compatible with the RPent environment,
+``AWOMO05_MODEL_PATH`` enables automatic local startup; ``--vla-model-path``
+overrides it. The local server loads the full model on one GPU using RPent's
+current Python interpreter.
+
+To use a separate model environment, install the policy dependencies and RPent's
+core package there, then start the service:
+
+.. code-block:: bash
+
+   python -m robots.robodojo.awomo05_server --model-path /path/to/awomo05 \
+     --host 127.0.0.1 --port 9205
+
+Add ``--vla-endpoint socket://127.0.0.1:9205`` to the task command in the
 RPent/simulator environment. RPent starts and stops its own model process;
 independently started services remain under their operator's control.
 For remote deployment, see :doc:`../guides/advanced_deployment`.
@@ -272,8 +335,8 @@ run, inspect these files in the directory selected by ``--output-dir``:
 - ``states.json``: commands, execution results and synchronized observation records.
 - Per-step RGB, metric depth, calibration and world-xyz artifacts for available cameras.
 - ``videos/``: head, left-wrist, and right-wrist camera videos.
-- ``robodojo_env_server.log``, ``sam3_server.log`` and ``robodojo_vpp2_server.log``:
-  locally owned service startup and error logs.
+- ``robodojo_env_server.log``, ``sam3_server.log``, and ``robodojo_vpp2_server.log``
+  or ``robodojo_awomo05_server.log``: locally owned service startup and error logs.
 - ``run.log`` and ``transcript_*.json``: main-process logs, planner conversations,
   and errors.
 
@@ -289,9 +352,9 @@ concurrent runs. For live monitoring, see :doc:`../guides/dashboard`.
 Common Options
 --------------
 
-RPent starts the simulator, SAM3 and VPP2 services in the current Python environment
-by default. Specify ``--sim-python`` when the simulator uses a separate
-environment.
+RPent starts the simulator, SAM3 and selected VLA model services in the current
+Python environment by default. Specify ``--sim-python`` when the simulator uses
+a separate environment.
 
 Use ``--task`` to select a task. For a fixed scene, ``--seed`` selects an
 official layout group and ``--layout`` selects a layout within that group;
@@ -302,11 +365,12 @@ in this mode.
 
 - ``--cuda-device`` selects the GPU for locally started services. If omitted,
   services inherit ``CUDA_VISIBLE_DEVICES``.
-- ``--vla-backend`` selects the action model; currently ``vpp2`` is supported.
-- ``--vla-model-path`` overrides ``VPP2_MODEL_PATH`` and points to the resource
-  root containing ``policy/`` and ``checkpoints/``.
+- ``--vla-backend`` accepts ``vpp2`` (default) or ``awomo05``.
+- ``--vla-model-path`` selects the resource root containing ``policy/`` and
+  ``checkpoints/``, overriding ``VPP2_MODEL_PATH`` or ``AWOMO05_MODEL_PATH``
+  for the selected backend.
 - ``--env-endpoint``, ``--sam3-endpoint`` and ``--vla-endpoint`` connect to
-  existing services. The VLA endpoint must serve this adapter's VPP2 protocol.
+  existing RPent RPC services; the VLA protocol must match the selected backend.
 - ``--source-root`` selects a local RoboDojo checkout instead of the packaged code.
 
 Child services inherit the current shell environment. The CLI does not load
@@ -325,12 +389,21 @@ record index. Reading historical observations does not consume action steps.
 
 ``vpp2_act(instruction, chunks=1)`` runs the specified subtask. Each chunk
 predicts 32 absolute dual-arm EE16 targets (xyz, wxyz and gripper per arm)
-and executes the first 24 through native EE control before replanning.
+and executes the first 24 through native EE control. With ``chunks=1``, control
+returns to the planner; each additional chunk starts with a new prediction.
 VPP2 uses the initial RGB frame and eight history samples spaced by 25 actions.
 Both policy and primitive actions update this history; switching subtasks
 preserves it. Image reads and ``render`` do not advance the action timeline.
 Missing action feedback invalidates policy history until reset; start a new
 episode to resume VPP2 when reset is unavailable.
+
+With the Awomo05 backend, ``awomo05_act(chunks=1)`` executes dual-arm
+joint targets using the original full task instruction, taken from the initial
+observation and held fixed for the episode. Each chunk executes eight steps with per-action observation updates; the next chunk starts fresh
+inference. ``chunks`` limits action blocks per call. Model history persists
+across calls and includes observations after motion primitives. Cancelled
+chunks are not resumed. If inference or execution results are uncertain,
+inspect the error and start a new episode rather than retrying.
 
 ``view_env_state`` reads saved images and state; ``render`` captures a new
 observation. ``sample_world_xyz(view, pixels, step=None, neighborhood=1)``
